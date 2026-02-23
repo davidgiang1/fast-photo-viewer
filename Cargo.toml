@@ -1,0 +1,12 @@
+[package]
+name = "fast-photo-viewer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+eframe = "0.26"
+egui_extras = { version = "0.26", features = ["all_loaders"] }
+image = { version = "0.24", features = ["default"] } # Enable all formats
+walkdir = "2"
+rand = "0.8"
+rfd = "0.12"
