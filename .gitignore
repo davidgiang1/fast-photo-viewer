@@ -1,1 +1,7 @@
 /target
+/.claude
+/ffmpeg-dev
+/ffmpeg-btbn
+/ffmpeg7
+*.7z
+*.zip
