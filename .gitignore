@@ -3,5 +3,7 @@
 /ffmpeg-dev
 /ffmpeg-btbn
 /ffmpeg7
+/dlls
+/output
 *.7z
 *.zip

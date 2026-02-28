@@ -2,6 +2,11 @@
 name = "fast-photo-viewer"
 version = "0.2.0"
 edition = "2021"
+description = "A fast, lightweight photo and video viewer"
+repository = "https://github.com/davidgiang1/fast-photo-viewer"
+
+[build-dependencies.winres]
+version = "0.1"
 
 [dependencies]
 eframe = "0.29"

@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use eframe::egui;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -37,19 +39,25 @@ fn is_supported_file(path: &Path) -> bool {
 }
 
 fn main() -> eframe::Result<()> {
+    let initial_file: Option<PathBuf> = std::env::args().nth(1).map(PathBuf::from);
+
+    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
+        .expect("Failed to load app icon");
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([800.0, 600.0])
-            .with_title("Fast Photo Viewer"),
+            .with_title("Fast Photo Viewer")
+            .with_icon(std::sync::Arc::new(icon)),
         ..Default::default()
     };
 
     eframe::run_native(
         "Fast Photo Viewer",
         options,
-        Box::new(|cc| {
+        Box::new(move |cc| {
             egui_extras::install_image_loaders(&cc.egui_ctx);
-            Ok(Box::new(PhotoViewer::new(cc)) as Box<dyn eframe::App>)
+            Ok(Box::new(PhotoViewer::new(cc, initial_file)) as Box<dyn eframe::App>)
         }),
     )
 }
@@ -79,10 +87,11 @@ struct PhotoViewer {
     scan_count: Arc<Mutex<usize>>,
     texture: Option<egui::TextureHandle>,
     error_msg: Option<String>,
+    pending_initial_file: Option<PathBuf>,
 }
 
 impl PhotoViewer {
-    fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(_cc: &eframe::CreationContext<'_>, initial_file: Option<PathBuf>) -> Self {
         let audio_device = AudioDevice::new().expect("Failed to initialize audio device");
         Self {
             media_paths: Arc::new(Mutex::new(Vec::new())),
@@ -102,6 +111,7 @@ impl PhotoViewer {
             scan_count: Arc::new(Mutex::new(0)),
             texture: None,
             error_msg: None,
+            pending_initial_file: initial_file,
         }
     }
 
@@ -397,6 +407,19 @@ impl PhotoViewer {
 
 impl eframe::App for PhotoViewer {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Handle deferred initial file loading (first frame only)
+        if let Some(path) = self.pending_initial_file.take() {
+            if path.exists() && path.is_file() {
+                if let Some(parent) = path.parent() {
+                    self.start_scan(parent.to_path_buf());
+                }
+                self.current_media_path = Some(path.clone());
+                self.history.push(path.clone());
+                self.history_index = Some(0);
+                self.load_media(path, ctx);
+            }
+        }
+
         // Process video state
         if let Some(player) = &mut self.video_player {
             player.process_state();

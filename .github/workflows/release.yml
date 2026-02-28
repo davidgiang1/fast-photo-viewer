@@ -1,0 +1,87 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Download FFmpeg shared build
+        shell: bash
+        run: |
+          curl -L -o ffmpeg.zip "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-win64-gpl-shared-7.1.zip"
+          unzip -q ffmpeg.zip -d ffmpeg7
+
+      - name: Build release binary
+        shell: bash
+        run: |
+          export FFMPEG_DIR="${GITHUB_WORKSPACE}/ffmpeg7/ffmpeg-n7.1-latest-win64-gpl-shared-7.1"
+          cargo build --release
+
+      - name: Stage DLLs for installer
+        shell: bash
+        run: |
+          mkdir -p dlls
+          cp ffmpeg7/ffmpeg-n7.1-latest-win64-gpl-shared-7.1/bin/*.dll dlls/
+          cp target/release/SDL2.dll dlls/
+
+      - name: Install Inno Setup
+        shell: powershell
+        run: choco install innosetup -y --no-progress
+
+      - name: Build installer
+        shell: cmd
+        run: |
+          "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\setup.iss
+
+      - name: Extract version from tag
+        id: version
+        shell: bash
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Fast Photo Viewer v${{ steps.version.outputs.VERSION }}"
+          draft: false
+          prerelease: false
+          files: |
+            output/FastPhotoViewer-*-setup.exe
+          body: |
+            ## Fast Photo Viewer v${{ steps.version.outputs.VERSION }}
+
+            ### Installation
+            1. Download `FastPhotoViewer-${{ steps.version.outputs.VERSION }}-setup.exe`
+            2. Run the installer
+            3. Choose which file types to associate (images checked by default, videos optional)
+            4. To set as your default viewer, go to **Windows Settings > Default Apps** and search for **Fast Photo Viewer**
+
+            ### Supported Formats
+            **Images:** jpg, jpeg, png, bmp, webp, gif, tiff, ico, svg
+            **Videos:** mp4, mkv, avi, mov, wmv, flv, webm, m4v, mpg, mpeg, 3gp, ogv, vob
