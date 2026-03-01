@@ -21,6 +21,38 @@ const VIDEO_EXTENSIONS: &[&str] = &[
     "mpg", "mpeg", "3gp", "ogv", "ts", "vob",
 ];
 
+#[derive(Clone, Copy, PartialEq)]
+enum MediaFilter {
+    All,
+    ImagesOnly,
+    VideosOnly,
+}
+
+impl MediaFilter {
+    fn label(self) -> &'static str {
+        match self {
+            MediaFilter::All => "All Media",
+            MediaFilter::ImagesOnly => "Images Only",
+            MediaFilter::VideosOnly => "Videos Only",
+        }
+    }
+
+    fn cycle(self) -> Self {
+        match self {
+            MediaFilter::All => MediaFilter::ImagesOnly,
+            MediaFilter::ImagesOnly => MediaFilter::VideosOnly,
+            MediaFilter::VideosOnly => MediaFilter::All,
+        }
+    }
+}
+
+fn is_image_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|ext| IMAGE_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
 fn is_video_file(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
@@ -29,13 +61,15 @@ fn is_video_file(path: &Path) -> bool {
 }
 
 fn is_supported_file(path: &Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .map(|ext| {
-            let ext = ext.to_lowercase();
-            IMAGE_EXTENSIONS.contains(&ext.as_str()) || VIDEO_EXTENSIONS.contains(&ext.as_str())
-        })
-        .unwrap_or(false)
+    is_image_file(path) || is_video_file(path)
+}
+
+fn matches_filter(path: &Path, filter: MediaFilter) -> bool {
+    match filter {
+        MediaFilter::All => true,
+        MediaFilter::ImagesOnly => is_image_file(path),
+        MediaFilter::VideosOnly => is_video_file(path),
+    }
 }
 
 fn main() -> eframe::Result<()> {
@@ -73,7 +107,12 @@ struct PhotoViewer {
     is_video: bool,
     video_looping: bool,
     video_volume: f32,
+    video_has_audio: bool,
     seek_frac: f32,
+    video_rotation: u16,
+
+    // UI state
+    last_esc_press: Option<std::time::Instant>,
 
     // History
     history: Vec<PathBuf>,
@@ -82,6 +121,9 @@ struct PhotoViewer {
     // View State
     zoom: f32,
     pan: egui::Vec2,
+
+    // Filter
+    media_filter: MediaFilter,
 
     is_scanning: Arc<Mutex<bool>>,
     scan_count: Arc<Mutex<usize>>,
@@ -101,12 +143,16 @@ impl PhotoViewer {
             audio_device,
             is_video: false,
             video_looping: true,
-            video_volume: 1.0,
+            video_volume: 0.10,
+            video_has_audio: true,
             seek_frac: 0.0,
+            video_rotation: 0,
+            last_esc_press: None,
             history: Vec::new(),
             history_index: None,
             zoom: 1.0,
             pan: egui::Vec2::ZERO,
+            media_filter: MediaFilter::All,
             is_scanning: Arc::new(Mutex::new(false)),
             scan_count: Arc::new(Mutex::new(0)),
             texture: None,
@@ -180,17 +226,23 @@ impl PhotoViewer {
     fn reset_view(&mut self) {
         self.zoom = 1.0;
         self.pan = egui::Vec2::ZERO;
+        self.video_rotation = 0;
     }
 
     fn go_next(&mut self, ctx: &egui::Context) {
         if let Some(idx) = self.history_index {
-            if idx + 1 < self.history.len() {
-                self.history_index = Some(idx + 1);
-                let path = self.history[idx + 1].clone();
-                self.current_media_path = Some(path.clone());
-                self.reset_view();
-                self.load_media(path, ctx);
-                return;
+            // Look forward through history for a matching entry
+            let mut next_idx = idx + 1;
+            while next_idx < self.history.len() {
+                if matches_filter(&self.history[next_idx], self.media_filter) {
+                    self.history_index = Some(next_idx);
+                    let path = self.history[next_idx].clone();
+                    self.current_media_path = Some(path.clone());
+                    self.reset_view();
+                    self.load_media(path, ctx);
+                    return;
+                }
+                next_idx += 1;
             }
         }
         self.next_random_media(ctx);
@@ -198,12 +250,17 @@ impl PhotoViewer {
 
     fn go_prev(&mut self, ctx: &egui::Context) {
         if let Some(idx) = self.history_index {
-            if idx > 0 {
-                self.history_index = Some(idx - 1);
-                let path = self.history[idx - 1].clone();
-                self.current_media_path = Some(path.clone());
-                self.reset_view();
-                self.load_media(path, ctx);
+            let mut prev_idx = idx;
+            while prev_idx > 0 {
+                prev_idx -= 1;
+                if matches_filter(&self.history[prev_idx], self.media_filter) {
+                    self.history_index = Some(prev_idx);
+                    let path = self.history[prev_idx].clone();
+                    self.current_media_path = Some(path.clone());
+                    self.reset_view();
+                    self.load_media(path, ctx);
+                    return;
+                }
             }
         }
     }
@@ -217,8 +274,9 @@ impl PhotoViewer {
 
             let history_set: HashSet<&PathBuf> = self.history.iter().collect();
 
+            // Filter by media type AND exclude already-seen files
             let available: Vec<&PathBuf> = paths.iter()
-                .filter(|p| !history_set.contains(p))
+                .filter(|p| matches_filter(p, self.media_filter) && !history_set.contains(p))
                 .collect();
 
             let mut rng = rand::thread_rng();
@@ -226,14 +284,17 @@ impl PhotoViewer {
             if !available.is_empty() {
                 available.choose(&mut rng).map(|p| (*p).clone())
             } else {
-                if paths.len() > 1 {
-                    paths.iter()
-                        .filter(|p| Some(*p) != self.current_media_path.as_ref())
-                        .collect::<Vec<_>>()
-                        .choose(&mut rng)
-                        .map(|p| (*p).clone())
+                // All matching files seen — pick any matching file except the current one
+                let matching: Vec<&PathBuf> = paths.iter()
+                    .filter(|p| matches_filter(p, self.media_filter) && Some(*p) != self.current_media_path.as_ref())
+                    .collect();
+                if !matching.is_empty() {
+                    matching.choose(&mut rng).map(|p| (*p).clone())
                 } else {
-                    paths.choose(&mut rng).cloned()
+                    // Only one matching file (or none)
+                    paths.iter()
+                        .find(|p| matches_filter(p, self.media_filter))
+                        .cloned()
                 }
             }
         };
@@ -259,7 +320,7 @@ impl PhotoViewer {
             }
             #[cfg(not(target_os = "windows"))]
             {
-                // Fallback
+                let _ = path;
             }
         }
     }
@@ -287,6 +348,7 @@ impl PhotoViewer {
                         player.start();
                         self.video_player = Some(player);
                         self.is_video = true;
+                        self.video_has_audio = true;
                         self.seek_frac = 0.0;
                         self.error_msg = None;
                     }
@@ -298,6 +360,7 @@ impl PhotoViewer {
                         player.start();
                         self.video_player = Some(player);
                         self.is_video = true;
+                        self.video_has_audio = false;
                         self.seek_frac = 0.0;
                         self.error_msg = None;
                     }
@@ -403,6 +466,26 @@ impl PhotoViewer {
             format!("{:02}:{:02}", mins, secs)
         }
     }
+
+    /// Render a video frame with rotation using a custom textured mesh.
+    fn render_rotated_video(ui: &mut egui::Ui, texture_id: egui::TextureId, rect: egui::Rect, rotation: u16) {
+        // UV coordinates for each rotation (top-left, top-right, bottom-right, bottom-left)
+        let uvs: [(f32, f32); 4] = match rotation {
+            90  => [(0.0, 1.0), (0.0, 0.0), (1.0, 0.0), (1.0, 1.0)],
+            180 => [(1.0, 1.0), (0.0, 1.0), (0.0, 0.0), (1.0, 0.0)],
+            270 => [(1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (0.0, 0.0)],
+            _   => [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)],
+        };
+
+        let white = egui::Color32::WHITE;
+        let mut mesh = egui::Mesh::with_texture(texture_id);
+        mesh.vertices.push(egui::epaint::Vertex { pos: rect.left_top(),     uv: egui::pos2(uvs[0].0, uvs[0].1), color: white });
+        mesh.vertices.push(egui::epaint::Vertex { pos: rect.right_top(),    uv: egui::pos2(uvs[1].0, uvs[1].1), color: white });
+        mesh.vertices.push(egui::epaint::Vertex { pos: rect.right_bottom(), uv: egui::pos2(uvs[2].0, uvs[2].1), color: white });
+        mesh.vertices.push(egui::epaint::Vertex { pos: rect.left_bottom(),  uv: egui::pos2(uvs[3].0, uvs[3].1), color: white });
+        mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+        ui.painter().add(egui::Shape::mesh(mesh));
+    }
 }
 
 impl eframe::App for PhotoViewer {
@@ -460,15 +543,15 @@ impl eframe::App for PhotoViewer {
                     }
                 }
             }
-            // Volume: Up/Down arrows ±5%
+            // Volume: Up/Down arrows ±2%
             if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
-                self.video_volume = (self.video_volume + 0.05).clamp(0.0, 1.0);
+                self.video_volume = (self.video_volume + 0.02).clamp(0.0, 1.0);
                 if let Some(player) = &mut self.video_player {
                     player.options.audio_volume.set(self.video_volume);
                 }
             }
             if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
-                self.video_volume = (self.video_volume - 0.05).clamp(0.0, 1.0);
+                self.video_volume = (self.video_volume - 0.02).clamp(0.0, 1.0);
                 if let Some(player) = &mut self.video_player {
                     player.options.audio_volume.set(self.video_volume);
                 }
@@ -504,12 +587,43 @@ impl eframe::App for PhotoViewer {
             self.open_file_dialog(ctx);
         }
 
-        // Handle Zoom (Mouse Wheel) - images only
+        // F11: toggle fullscreen (both modes)
+        if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
+            let is_fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!is_fullscreen));
+        }
+
+        // Double-tap Esc within 500ms to close the app
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            let now = std::time::Instant::now();
+            if let Some(last) = self.last_esc_press {
+                if now.duration_since(last) < std::time::Duration::from_millis(500) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+            self.last_esc_press = Some(now);
+        }
+
+        // M: cycle media filter
+        if ctx.input(|i| i.key_pressed(egui::Key::M)) {
+            self.media_filter = self.media_filter.cycle();
+        }
+
+        // Handle Zoom (Mouse Wheel + keyboard) - images only
         if !self.is_video {
             let scroll = ctx.input(|i| i.raw_scroll_delta);
             if scroll.y != 0.0 {
                 let zoom_factor = if scroll.y > 0.0 { 1.1 } else { 0.9 };
                 self.zoom *= zoom_factor;
+                self.zoom = self.zoom.clamp(0.1, 50.0);
+            }
+            // +/= to zoom in, - to zoom out
+            if ctx.input(|i| i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals)) {
+                self.zoom *= 1.15;
+                self.zoom = self.zoom.clamp(0.1, 50.0);
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::Minus)) {
+                self.zoom *= 0.87;
                 self.zoom = self.zoom.clamp(0.1, 50.0);
             }
         }
@@ -522,18 +636,24 @@ impl eframe::App for PhotoViewer {
                 // Video rendering
                 if let Some(player) = &mut self.video_player {
                     let available = rect.size();
-                    // Reserve space for controls at bottom
-                    let controls_height = 40.0;
+                    // Reserve space for controls at bottom (two rows)
+                    let controls_height = 66.0;
                     let video_area = egui::vec2(available.x, available.y - controls_height);
 
                     // Scale video to fit while maintaining aspect ratio
+                    // For 90/270 rotation, swap the video dimensions for aspect ratio calc
                     let video_size = player.size;
-                    let scale = if video_size.x > 0.0 && video_size.y > 0.0 {
-                        (video_area.x / video_size.x).min(video_area.y / video_size.y)
+                    let (effective_w, effective_h) = if self.video_rotation == 90 || self.video_rotation == 270 {
+                        (video_size.y, video_size.x)
+                    } else {
+                        (video_size.x, video_size.y)
+                    };
+                    let scale = if effective_w > 0.0 && effective_h > 0.0 {
+                        (video_area.x / effective_w).min(video_area.y / effective_h)
                     } else {
                         1.0
                     };
-                    let display_size = video_size * scale;
+                    let display_size = egui::vec2(effective_w * scale, effective_h * scale);
 
                     // Center the video in the available area
                     let video_rect = egui::Rect::from_center_size(
@@ -544,23 +664,31 @@ impl eframe::App for PhotoViewer {
                         display_size,
                     );
 
-                    player.ui_at(ui, video_rect);
+                    if self.video_rotation == 0 {
+                        player.render_frame_at(ui, video_rect);
+                    } else {
+                        let texture_id = player.texture_handle.id();
+                        Self::render_rotated_video(ui, texture_id, video_rect, self.video_rotation);
+                    }
 
-                    // Controls bar at bottom
+                    // Controls bar at bottom (two rows)
+                    let controls_height_actual = 66.0;
                     let controls_rect = egui::Rect::from_min_size(
-                        egui::pos2(rect.min.x, rect.max.y - controls_height),
-                        egui::vec2(available.x, controls_height),
+                        egui::pos2(rect.min.x, rect.max.y - controls_height_actual),
+                        egui::vec2(available.x, controls_height_actual),
                     );
 
-                    // Build controls in a window overlay for better styling
+                    let video_has_audio = self.video_has_audio;
+                    let video_looping = self.video_looping;
+
                     egui::Window::new("VideoControls")
                         .fixed_rect(controls_rect)
                         .title_bar(false)
                         .resizable(false)
-                        .frame(egui::Frame::none().fill(egui::Color32::from_black_alpha(180)).inner_margin(4.0))
+                        .frame(egui::Frame::none().fill(egui::Color32::from_black_alpha(180)).inner_margin(egui::Margin::symmetric(6.0, 4.0)))
                         .show(ctx, |ui| {
+                            // ── Row 1: Play/Pause + seek bar + duration ──
                             ui.horizontal(|ui| {
-                                // Play/Pause button
                                 let state = player.player_state.get();
                                 let btn_text = match state {
                                     PlayerState::Playing => "⏸",
@@ -578,7 +706,6 @@ impl eframe::App for PhotoViewer {
                                     }
                                 }
 
-                                // Current time
                                 let elapsed = player.elapsed_ms();
                                 let duration = player.duration_ms;
                                 ui.label(
@@ -587,7 +714,8 @@ impl eframe::App for PhotoViewer {
                                         .monospace(),
                                 );
 
-                                // Seek bar
+                                // Duration label width reservation (~55px for "00:00:00")
+                                let dur_label_w = 55.0;
                                 let mut seek_pos = if duration > 0 {
                                     elapsed as f32 / duration as f32
                                 } else {
@@ -596,26 +724,25 @@ impl eframe::App for PhotoViewer {
                                 let slider = egui::Slider::new(&mut seek_pos, 0.0..=1.0)
                                     .show_value(false)
                                     .trailing_fill(true);
-                                let response = ui.add_sized(
-                                    [ui.available_width() - 120.0, 20.0],
-                                    slider,
-                                );
+                                let seek_w = (ui.available_width() - dur_label_w).max(80.0);
+                                let response = ui.add_sized([seek_w, 18.0], slider);
                                 if response.changed() {
                                     player.seek(seek_pos);
                                 }
 
-                                // Total time
                                 ui.label(
                                     egui::RichText::new(Self::format_time(duration))
-                                        .color(egui::Color32::WHITE)
+                                        .color(egui::Color32::from_rgb(200, 200, 200))
                                         .monospace(),
                                 );
+                            });
 
+                            // ── Row 2: Loop | Volume (or no-audio) | Fullscreen ──
+                            ui.horizontal(|ui| {
                                 // Loop toggle
-                                let loop_text = if player.options.looping { "🔁" } else { "🔁" };
                                 let loop_btn = ui.button(
-                                    egui::RichText::new(loop_text).color(
-                                        if player.options.looping {
+                                    egui::RichText::new("🔁").color(
+                                        if video_looping {
                                             egui::Color32::from_rgb(100, 200, 255)
                                         } else {
                                             egui::Color32::GRAY
@@ -627,28 +754,41 @@ impl eframe::App for PhotoViewer {
                                     player.options.looping = self.video_looping;
                                 }
 
-                                // Volume control
-                                let vol_icon = if self.video_volume == 0.0 { "🔇" } else { "🔊" };
-                                ui.label(egui::RichText::new(vol_icon).color(egui::Color32::WHITE));
-                                let vol_slider = egui::Slider::new(&mut self.video_volume, 0.0..=1.0)
-                                    .show_value(false)
-                                    .trailing_fill(true);
-                                let vol_response = ui.add_sized([60.0, 20.0], vol_slider);
-                                if vol_response.changed() {
-                                    player.options.audio_volume.set(self.video_volume);
+                                if video_has_audio {
+                                    // Volume control
+                                    let vol_icon = if self.video_volume == 0.0 { "🔇" } else { "🔊" };
+                                    ui.label(egui::RichText::new(vol_icon).color(egui::Color32::WHITE));
+                                    let vol_slider = egui::Slider::new(&mut self.video_volume, 0.0..=1.0)
+                                        .show_value(false)
+                                        .trailing_fill(true);
+                                    let vol_w = (ui.available_width() - 40.0).min(140.0).max(60.0);
+                                    let vol_response = ui.add_sized([vol_w, 16.0], vol_slider);
+                                    if vol_response.changed() {
+                                        player.options.audio_volume.set(self.video_volume);
+                                    }
+                                    vol_response.on_hover_text(
+                                        format!("Volume: {}%", (self.video_volume * 100.0).round() as i32)
+                                    );
+                                } else {
+                                    // No audio track indicator
+                                    ui.label(
+                                        egui::RichText::new("🔇 No Audio")
+                                            .color(egui::Color32::from_rgb(180, 180, 180))
+                                            .small(),
+                                    );
                                 }
 
-                                // Fullscreen toggle
-                                let is_fullscreen = ctx.input(|i| {
-                                    i.viewport().fullscreen.unwrap_or(false)
+                                // Push fullscreen to the right
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    let is_fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+                                    let fs_icon = if is_fullscreen { "⊡" } else { "⊞" };
+                                    if ui.button(egui::RichText::new(fs_icon).color(egui::Color32::WHITE))
+                                        .on_hover_text("Toggle fullscreen (F11)")
+                                        .clicked()
+                                    {
+                                        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!is_fullscreen));
+                                    }
                                 });
-                                let fs_icon = if is_fullscreen { "⊡" } else { "⊞" };
-                                if ui.button(egui::RichText::new(fs_icon).color(egui::Color32::WHITE))
-                                    .on_hover_text("Toggle fullscreen")
-                                    .clicked()
-                                {
-                                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!is_fullscreen));
-                                }
                             });
                         });
 
@@ -692,14 +832,16 @@ impl eframe::App for PhotoViewer {
                     ui.centered_and_justified(|ui| {
                         ui.label(
                             egui::RichText::new(
-                                "Press 'O' to Open Folder\nPress 'F' to Open File\n\n\
-                                 Images: Space/Right: Next | Left: Previous\n\
-                                 Videos: Left/Right: Seek 5s | Ctrl+Left/Right: Prev/Next\n\
-                                 Space: Play/Pause (video) | Next (image)\n\
-                                 Scroll to Zoom | Drag to Pan",
+                                "Press 'O' to Open Folder  |  'F' to Open File\n\n\
+                                 Images: Space / Right Arrow = Next  |  Left Arrow = Prev  |  +/- Zoom\n\
+                                 Videos: Left/Right Arrow = Seek 5s  |  Ctrl + Left/Right = Prev/Next\n\
+                                 Space: Play/Pause (video)  |  Next (image)\n\
+                                 Scroll to Zoom  |  Drag to Pan\n\
+                                 F11: Fullscreen  |  M: Filter (All / Images / Videos)\n\
+                                 Double-tap Esc: Close",
                             )
                             .color(egui::Color32::WHITE)
-                            .size(20.0),
+                            .size(18.0),
                         );
                     });
                 }
@@ -743,13 +885,20 @@ impl eframe::App for PhotoViewer {
                                 }
                             }
                         }
+                        // Show active filter
+                        if self.media_filter != MediaFilter::All {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(100, 200, 255),
+                                format!("Filter: {}", self.media_filter.label()),
+                            );
+                        }
                         if let Some(err) = &self.error_msg {
                             ui.colored_label(egui::Color32::RED, err);
                         }
                     });
             }
 
-            // Controls overlay (hide rotation for videos)
+            // Controls overlay — rotation for both images and videos
             if self.current_media_path.is_some() {
                 egui::Window::new("Controls")
                     .anchor(egui::Align2::RIGHT_BOTTOM, [-10.0, -10.0])
@@ -758,24 +907,30 @@ impl eframe::App for PhotoViewer {
                     .auto_sized()
                     .frame(egui::Frame::popup(ui.style()).multiply_with_opacity(0.8))
                     .show(ctx, |ui| {
-                        if !self.is_video {
-                            ui.horizontal(|ui| {
-                                if ui
-                                    .button("⟲")
-                                    .on_hover_text("Rotate Left")
-                                    .clicked()
-                                {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .button("⟲")
+                                .on_hover_text("Rotate Left")
+                                .clicked()
+                            {
+                                if self.is_video {
+                                    self.video_rotation = (self.video_rotation + 270) % 360;
+                                } else {
                                     self.rotate_ccw(ctx);
                                 }
-                                if ui
-                                    .button("⟳")
-                                    .on_hover_text("Rotate Right")
-                                    .clicked()
-                                {
+                            }
+                            if ui
+                                .button("⟳")
+                                .on_hover_text("Rotate Right")
+                                .clicked()
+                            {
+                                if self.is_video {
+                                    self.video_rotation = (self.video_rotation + 90) % 360;
+                                } else {
                                     self.rotate_cw(ctx);
                                 }
-                            });
-                        }
+                            }
+                        });
                         if ui.button("📂 Show in Explorer").clicked() {
                             self.open_in_explorer();
                         }
