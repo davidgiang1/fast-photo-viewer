@@ -11,6 +11,7 @@ use walkdir::WalkDir;
 use rand::seq::SliceRandom;
 use image::DynamicImage;
 use egui_video::{AudioDevice, Player, PlayerState};
+use ffmpeg_the_third as ffmpeg;
 
 const IMAGE_EXTENSIONS: &[&str] = &[
     "jpg", "jpeg", "png", "bmp", "webp", "gif", "tiff", "ico", "svg",
@@ -72,11 +73,25 @@ fn matches_filter(path: &Path, filter: MediaFilter) -> bool {
     }
 }
 
+/// Check if a video file actually contains an audio stream using ffmpeg.
+fn file_has_audio_stream(path: &Path) -> bool {
+    match ffmpeg::format::input(&path) {
+        Ok(ctx) => ctx.streams().any(|s| s.parameters().medium() == ffmpeg::media::Type::Audio),
+        Err(_) => true, // Assume audio if probe fails
+    }
+}
+
 fn main() -> eframe::Result<()> {
     let initial_file: Option<PathBuf> = std::env::args().nth(1).map(PathBuf::from);
 
-    let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
-        .expect("Failed to load app icon");
+    let icon_bytes = include_bytes!("../assets/icon.ico");
+    let icon_image = image::load_from_memory(icon_bytes).expect("Failed to load app icon");
+    let icon_rgba = icon_image.into_rgba8();
+    let icon = egui::IconData {
+        width: icon_rgba.width(),
+        height: icon_rgba.height(),
+        rgba: icon_rgba.into_raw(),
+    };
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -338,17 +353,21 @@ impl PhotoViewer {
         self.current_image = None;
         self.texture = None;
 
+        // Probe file for audio streams before opening player
+        self.video_has_audio = file_has_audio_stream(&path);
+
         let path_str = path.to_string_lossy().to_string();
         match Player::new(ctx, &path_str) {
             Ok(player) => {
                 match player.with_audio(&mut self.audio_device) {
                     Ok(mut player) => {
                         player.options.looping = self.video_looping;
-                        player.options.audio_volume.set(self.video_volume);
+                        if self.video_has_audio {
+                            player.options.audio_volume.set(self.video_volume);
+                        }
                         player.start();
                         self.video_player = Some(player);
                         self.is_video = true;
-                        self.video_has_audio = true;
                         self.seek_frac = 0.0;
                         self.error_msg = None;
                     }
@@ -521,11 +540,11 @@ impl eframe::App for PhotoViewer {
                     self.go_prev(ctx);
                 }
             } else {
-                // Seek ±5 seconds
+                // Seek ±3 seconds
                 if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
                     if let Some(player) = &mut self.video_player {
                         if player.duration_ms > 0 {
-                            let step = 5000.0 / player.duration_ms as f32;
+                            let step = 3000.0 / player.duration_ms as f32;
                             let current = player.elapsed_ms() as f32 / player.duration_ms as f32;
                             let target = (current + step).clamp(0.0, 1.0);
                             player.seek(target);
@@ -535,7 +554,7 @@ impl eframe::App for PhotoViewer {
                 if ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
                     if let Some(player) = &mut self.video_player {
                         if player.duration_ms > 0 {
-                            let step = 5000.0 / player.duration_ms as f32;
+                            let step = 3000.0 / player.duration_ms as f32;
                             let current = player.elapsed_ms() as f32 / player.duration_ms as f32;
                             let target = (current - step).clamp(0.0, 1.0);
                             player.seek(target);
@@ -609,8 +628,8 @@ impl eframe::App for PhotoViewer {
             self.media_filter = self.media_filter.cycle();
         }
 
-        // Handle Zoom (Mouse Wheel + keyboard) - images only
-        if !self.is_video {
+        // Handle Zoom (Mouse Wheel + keyboard) - images and videos
+        {
             let scroll = ctx.input(|i| i.raw_scroll_delta);
             if scroll.y != 0.0 {
                 let zoom_factor = if scroll.y > 0.0 { 1.1 } else { 0.9 };
@@ -636,9 +655,27 @@ impl eframe::App for PhotoViewer {
                 // Video rendering
                 if let Some(player) = &mut self.video_player {
                     let available = rect.size();
-                    // Reserve space for controls at bottom (two rows)
-                    let controls_height = 66.0;
+                    // Reserve space for controls at bottom
+                    let controls_height = 40.0;
                     let video_area = egui::vec2(available.x, available.y - controls_height);
+
+                    // Click-to-pause and drag-to-pan on the video area (above controls)
+                    let interact_rect = egui::Rect::from_min_size(rect.min, video_area);
+                    let video_interact = ui.interact(interact_rect, ui.id().with("video_interact"), egui::Sense::click_and_drag());
+                    if video_interact.dragged() {
+                        self.pan += video_interact.drag_delta();
+                    }
+                    if video_interact.clicked() {
+                        match player.player_state.get() {
+                            PlayerState::Playing => player.pause(),
+                            PlayerState::Paused => player.resume(),
+                            PlayerState::EndOfFile => {
+                                player.seek(0.0);
+                                player.resume();
+                            }
+                            _ => {}
+                        }
+                    }
 
                     // Scale video to fit while maintaining aspect ratio
                     // For 90/270 rotation, swap the video dimensions for aspect ratio calc
@@ -653,42 +690,46 @@ impl eframe::App for PhotoViewer {
                     } else {
                         1.0
                     };
-                    let display_size = egui::vec2(effective_w * scale, effective_h * scale);
+                    // Apply zoom to display size
+                    let display_size = egui::vec2(effective_w * scale * self.zoom, effective_h * scale * self.zoom);
 
-                    // Center the video in the available area
+                    // Center the video in the available area, with pan offset
                     let video_rect = egui::Rect::from_center_size(
                         egui::pos2(
                             rect.min.x + available.x / 2.0,
                             rect.min.y + video_area.y / 2.0,
-                        ),
+                        ) + self.pan,
                         display_size,
                     );
 
+                    // Render via painter directly (not render_frame_at) so our
+                    // click interaction isn't consumed by an internal widget.
+                    let texture_id = player.texture_handle.id();
                     if self.video_rotation == 0 {
-                        player.render_frame_at(ui, video_rect);
+                        ui.painter().image(
+                            texture_id,
+                            video_rect,
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            egui::Color32::WHITE,
+                        );
                     } else {
-                        let texture_id = player.texture_handle.id();
                         Self::render_rotated_video(ui, texture_id, video_rect, self.video_rotation);
                     }
 
-                    // Controls bar at bottom (two rows)
-                    let controls_height_actual = 66.0;
+                    // Controls bar at bottom
                     let controls_rect = egui::Rect::from_min_size(
-                        egui::pos2(rect.min.x, rect.max.y - controls_height_actual),
-                        egui::vec2(available.x, controls_height_actual),
+                        egui::pos2(rect.min.x, rect.max.y - controls_height),
+                        egui::vec2(available.x, controls_height),
                     );
-
-                    let video_has_audio = self.video_has_audio;
-                    let video_looping = self.video_looping;
 
                     egui::Window::new("VideoControls")
                         .fixed_rect(controls_rect)
                         .title_bar(false)
                         .resizable(false)
-                        .frame(egui::Frame::none().fill(egui::Color32::from_black_alpha(180)).inner_margin(egui::Margin::symmetric(6.0, 4.0)))
+                        .frame(egui::Frame::none().fill(egui::Color32::from_black_alpha(180)).inner_margin(4.0))
                         .show(ctx, |ui| {
-                            // ── Row 1: Play/Pause + seek bar + duration ──
                             ui.horizontal(|ui| {
+                                // Play/Pause button
                                 let state = player.player_state.get();
                                 let btn_text = match state {
                                     PlayerState::Playing => "⏸",
@@ -706,6 +747,7 @@ impl eframe::App for PhotoViewer {
                                     }
                                 }
 
+                                // Current time
                                 let elapsed = player.elapsed_ms();
                                 let duration = player.duration_ms;
                                 ui.label(
@@ -714,8 +756,7 @@ impl eframe::App for PhotoViewer {
                                         .monospace(),
                                 );
 
-                                // Duration label width reservation (~55px for "00:00:00")
-                                let dur_label_w = 55.0;
+                                // Seek bar
                                 let mut seek_pos = if duration > 0 {
                                     elapsed as f32 / duration as f32
                                 } else {
@@ -724,25 +765,34 @@ impl eframe::App for PhotoViewer {
                                 let slider = egui::Slider::new(&mut seek_pos, 0.0..=1.0)
                                     .show_value(false)
                                     .trailing_fill(true);
-                                let seek_w = (ui.available_width() - dur_label_w).max(80.0);
-                                let response = ui.add_sized([seek_w, 18.0], slider);
+                                let response = ui.add_sized(
+                                    [ui.available_width() - 160.0, 20.0],
+                                    slider,
+                                );
                                 if response.changed() {
                                     player.seek(seek_pos);
                                 }
+                                // Hover tooltip: show time at cursor position
+                                if response.hovered() {
+                                    if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+                                        let frac = ((pos.x - response.rect.left()) / response.rect.width()).clamp(0.0, 1.0);
+                                        let hover_ms = (frac * duration as f32) as i64;
+                                        response.on_hover_text(Self::format_time(hover_ms));
+                                    }
+                                }
 
+                                // Total time
                                 ui.label(
                                     egui::RichText::new(Self::format_time(duration))
-                                        .color(egui::Color32::from_rgb(200, 200, 200))
+                                        .color(egui::Color32::WHITE)
                                         .monospace(),
                                 );
-                            });
 
-                            // ── Row 2: Loop | Volume (or no-audio) | Fullscreen ──
-                            ui.horizontal(|ui| {
                                 // Loop toggle
+                                let loop_text = if player.options.looping { "🔁" } else { "🔁" };
                                 let loop_btn = ui.button(
-                                    egui::RichText::new("🔁").color(
-                                        if video_looping {
+                                    egui::RichText::new(loop_text).color(
+                                        if player.options.looping {
                                             egui::Color32::from_rgb(100, 200, 255)
                                         } else {
                                             egui::Color32::GRAY
@@ -754,41 +804,36 @@ impl eframe::App for PhotoViewer {
                                     player.options.looping = self.video_looping;
                                 }
 
-                                if video_has_audio {
-                                    // Volume control
+                                // Volume control or no-audio indicator
+                                if self.video_has_audio {
                                     let vol_icon = if self.video_volume == 0.0 { "🔇" } else { "🔊" };
                                     ui.label(egui::RichText::new(vol_icon).color(egui::Color32::WHITE));
                                     let vol_slider = egui::Slider::new(&mut self.video_volume, 0.0..=1.0)
                                         .show_value(false)
                                         .trailing_fill(true);
-                                    let vol_w = (ui.available_width() - 40.0).min(140.0).max(60.0);
-                                    let vol_response = ui.add_sized([vol_w, 16.0], vol_slider);
+                                    let vol_response = ui.add_sized([100.0, 20.0], vol_slider);
                                     if vol_response.changed() {
                                         player.options.audio_volume.set(self.video_volume);
                                     }
-                                    vol_response.on_hover_text(
-                                        format!("Volume: {}%", (self.video_volume * 100.0).round() as i32)
-                                    );
+                                    vol_response.on_hover_text(format!("{}%", (self.video_volume * 100.0).round() as i32));
                                 } else {
-                                    // No audio track indicator
                                     ui.label(
                                         egui::RichText::new("🔇 No Audio")
-                                            .color(egui::Color32::from_rgb(180, 180, 180))
-                                            .small(),
+                                            .color(egui::Color32::from_rgb(180, 180, 180)),
                                     );
                                 }
 
-                                // Push fullscreen to the right
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    let is_fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
-                                    let fs_icon = if is_fullscreen { "⊡" } else { "⊞" };
-                                    if ui.button(egui::RichText::new(fs_icon).color(egui::Color32::WHITE))
-                                        .on_hover_text("Toggle fullscreen (F11)")
-                                        .clicked()
-                                    {
-                                        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!is_fullscreen));
-                                    }
+                                // Fullscreen toggle
+                                let is_fullscreen = ctx.input(|i| {
+                                    i.viewport().fullscreen.unwrap_or(false)
                                 });
+                                let fs_icon = if is_fullscreen { "⊡" } else { "⊞" };
+                                if ui.button(egui::RichText::new(fs_icon).color(egui::Color32::WHITE))
+                                    .on_hover_text("Toggle fullscreen (F11)")
+                                    .clicked()
+                                {
+                                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!is_fullscreen));
+                                }
                             });
                         });
 
@@ -834,7 +879,7 @@ impl eframe::App for PhotoViewer {
                             egui::RichText::new(
                                 "Press 'O' to Open Folder  |  'F' to Open File\n\n\
                                  Images: Space / Right Arrow = Next  |  Left Arrow = Prev  |  +/- Zoom\n\
-                                 Videos: Left/Right Arrow = Seek 5s  |  Ctrl + Left/Right = Prev/Next\n\
+                                 Videos: Left/Right Arrow = Seek 3s  |  Ctrl + Left/Right = Prev/Next\n\
                                  Space: Play/Pause (video)  |  Next (image)\n\
                                  Scroll to Zoom  |  Drag to Pan\n\
                                  F11: Fullscreen  |  M: Filter (All / Images / Videos)\n\

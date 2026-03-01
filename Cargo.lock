@@ -1466,6 +1466,7 @@ dependencies = [
  "eframe",
  "egui-video",
  "egui_extras",
+ "ffmpeg-the-third",
  "image",
  "rand 0.8.5",
  "rfd",
