@@ -51,6 +51,11 @@ jobs:
           cp ffmpeg7/ffmpeg-n7.1-latest-win64-gpl-shared-7.1/bin/*.dll dlls/
           cp target/release/SDL2.dll dlls/
 
+      - name: Extract version from tag
+        id: version
+        shell: bash
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
       - name: Install Inno Setup
         shell: powershell
         run: choco install innosetup -y --no-progress
@@ -58,12 +63,7 @@ jobs:
       - name: Build installer
         shell: cmd
         run: |
-          "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\setup.iss
-
-      - name: Extract version from tag
-        id: version
-        shell: bash
-        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+          "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /dMyAppVersion=${{ steps.version.outputs.VERSION }} installer\setup.iss
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

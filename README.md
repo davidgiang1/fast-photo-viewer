@@ -23,7 +23,11 @@ To set as your default viewer, go to **Windows Settings > Default Apps** and sea
 - **File Associations:** Can be set as the default Windows viewer for images and videos.
 - **Random Slideshow:** Press `Space` or `Right Arrow`.
 - **Navigation History:** Use `Left Arrow`.
-- **Zoom & Pan:** Scroll to zoom, drag to pan.
+- **Zoom & Pan:** Scroll to zoom, drag to pan. Works on both images and videos.
+- **Media Filter:** Cycle between All / Images Only / Videos Only with `M`.
+- **Fullscreen:** Toggle with `F11` or the fullscreen button.
+- **Audio Detection:** Automatically detects whether a video has audio; shows mute indicator if not.
+- **Click to Pause:** Click anywhere on a video to toggle play/pause.
 - **File Explorer:** Open current file location.
 
 ## Usage
@@ -42,16 +46,27 @@ Or launch the application and use the keyboard shortcuts:
 | `F` | Open file |
 | `Space` / `Right Arrow` | Next image |
 | `Left Arrow` | Previous image |
+| `+` / `-` | Zoom in / out |
 | Scroll wheel | Zoom |
 | Click + drag | Pan |
+| `M` | Cycle media filter (All / Images / Videos) |
+| `F11` | Toggle fullscreen |
+| `Esc` × 2 | Close |
 
 ### Video Mode
 | Key | Action |
 |-----|--------|
 | `Space` | Play / Pause |
-| `Left` / `Right Arrow` | Seek +/- 5 seconds |
+| `Left` / `Right Arrow` | Seek ±3 seconds |
 | `Ctrl+Left` / `Ctrl+Right` | Previous / Next video |
-| `Up` / `Down Arrow` | Volume +/- 5% |
+| `Up` / `Down Arrow` | Volume +/- 2% |
+| `+` / `-` | Zoom in / out |
+| Scroll wheel | Zoom |
+| Click | Play / Pause |
+| Click + drag | Pan |
+| `M` | Cycle media filter (All / Images / Videos) |
+| `F11` | Toggle fullscreen |
+| `Esc` × 2 | Close |
 
 ## Building from Source
 

@@ -1,5 +1,4 @@
 #define MyAppName "Fast Photo Viewer"
-#define MyAppVersion "0.2.0"
 #define MyAppPublisher "David Giang"
 #define MyAppURL "https://github.com/davidgiang1/fast-photo-viewer"
 #define MyAppExeName "fast-photo-viewer.exe"
