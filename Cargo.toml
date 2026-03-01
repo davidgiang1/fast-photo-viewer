@@ -16,3 +16,4 @@ image = { version = "0.25" }
 walkdir = "2"
 rand = "0.8"
 rfd = "0.15"
+ffmpeg-the-third = "2.0"
