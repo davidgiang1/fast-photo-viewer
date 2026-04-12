@@ -63,6 +63,16 @@ enum VideoFramePayload {
         height: u32,
         bytes: Vec<u8>,
     },
+    /// NV12: planar Y (full resolution) + interleaved UV (half
+    /// resolution). Produced when HW-decoded frames arrive as NV12
+    /// after `av_hwframe_transfer_data`. Skipping swscale saves a
+    /// CPU YUV→RGB pass; GPU does the color conversion in a shader.
+    Nv12 {
+        width: u32,
+        height: u32,
+        y_plane: Vec<u8>,
+        uv_plane: Vec<u8>,
+    },
 }
 
 struct VideoFrame {
@@ -121,6 +131,7 @@ pub struct WgpuBackend {
     pub device: Arc<wgpu::Device>,
     pub queue: Arc<wgpu::Queue>,
     pub renderer: Arc<egui::mutex::RwLock<egui_wgpu::Renderer>>,
+    pub target_format: wgpu::TextureFormat,
     /// True when the wgpu device was created with the
     /// `TEXTURE_FORMAT_16BIT_NORM` feature, which gates use of
     /// `Rgba16Unorm` textures for our 10-bit source path.
@@ -139,6 +150,17 @@ pub struct Player {
     wgpu_texture_id: Option<egui::TextureId>,
     wgpu_texture_size: (u32, u32),
     wgpu_texture_format: Option<wgpu::TextureFormat>,
+    // NV12 direct-upload pipeline (partial Phase E)
+    yuv_renderer: Option<YuvRenderer>,
+    nv12_state: Option<Nv12GpuState>,
+    // Caches the intrinsic video frame size so the GUI can lay out
+    // the video area correctly even when the current GPU texture is
+    // a planar YUV pair without an associated `TextureId`.
+    intrinsic_size: (u32, u32),
+    /// When set, the most recent uploaded frame went through the
+    /// NV12 path — the main thread should render via
+    /// `draw_into_painter` instead of `painter.image(texture_id())`.
+    last_upload_was_nv12: bool,
     egui_ctx: egui::Context,
     last_uploaded_pts_us: i64,
     /// Wall-clock fallback: when the file has no audio, we advance the
@@ -249,6 +271,12 @@ impl Player {
             cmd_tx,
             _audio_stream: audio_stream,
             texture: None,
+            yuv_renderer: wgpu
+                .as_ref()
+                .map(|b| YuvRenderer::new(&b.device, b.target_format)),
+            nv12_state: None,
+            intrinsic_size: (0, 0),
+            last_upload_was_nv12: false,
             wgpu,
             wgpu_texture: None,
             wgpu_texture_id: None,
@@ -389,24 +417,43 @@ impl Player {
 
         if let Some(frame) = best {
             if frame.pts_us != self.last_uploaded_pts_us {
+                let (w, h) = match &frame.payload {
+                    VideoFramePayload::Rgba8Srgb { width, height, .. }
+                    | VideoFramePayload::Rgba16Unorm { width, height, .. }
+                    | VideoFramePayload::Nv12 { width, height, .. } => (*width, *height),
+                };
+                self.intrinsic_size = (w, h);
                 if self.wgpu.is_some() {
                     self.upload_wgpu(frame.payload);
                 } else {
                     match frame.payload {
                         VideoFramePayload::Rgba8Srgb { image, .. } => {
                             self.upload_egui(image);
+                            self.last_upload_was_nv12 = false;
                         }
-                        VideoFramePayload::Rgba16Unorm { .. } => {
-                            // 16-bit path is never chosen without a
+                        VideoFramePayload::Rgba16Unorm { .. }
+                        | VideoFramePayload::Nv12 { .. } => {
+                            // These variants never reach us without a
                             // wgpu backend — the decode thread gates
-                            // on `high_bit_depth_enabled` which is
-                            // false when `wgpu` is None.
+                            // on features that require one.
                         }
                     }
                 }
                 self.last_uploaded_pts_us = frame.pts_us;
             }
         }
+    }
+
+    /// True when the most recent frame was uploaded via the NV12
+    /// direct path; the renderer must draw it with a custom
+    /// PaintCallback because egui's image path can't sample planar
+    /// YUV textures.
+    pub fn is_nv12_path(&self) -> bool {
+        self.last_upload_was_nv12
+    }
+
+    pub fn intrinsic_size(&self) -> (u32, u32) {
+        self.intrinsic_size
     }
 
     fn upload_egui(&mut self, image: egui::ColorImage) {
@@ -434,6 +481,22 @@ impl Player {
             None => return,
         };
 
+        // NV12 path is entirely separate: two textures, bind group,
+        // custom render pipeline.
+        if let VideoFramePayload::Nv12 {
+            width,
+            height,
+            y_plane,
+            uv_plane,
+        } = payload
+        {
+            self.upload_wgpu_nv12(&backend, width, height, &y_plane, &uv_plane);
+            self.last_upload_was_nv12 = true;
+            return;
+        }
+        self.last_upload_was_nv12 = false;
+        self.nv12_state = None;
+
         let (width, height, wgpu_format, bytes_per_pixel): (u32, u32, wgpu::TextureFormat, u32) =
             match &payload {
                 VideoFramePayload::Rgba8Srgb { width, height, .. } => (
@@ -448,6 +511,7 @@ impl Player {
                     wgpu::TextureFormat::Rgba16Unorm,
                     8,
                 ),
+                VideoFramePayload::Nv12 { .. } => unreachable!("handled above"),
             };
 
         // (Re)create the wgpu texture on the first frame, when the
@@ -506,6 +570,7 @@ impl Player {
                 )
             },
             VideoFramePayload::Rgba16Unorm { bytes, .. } => bytes.as_slice(),
+            VideoFramePayload::Nv12 { .. } => unreachable!("handled above"),
         };
         if let Some(tex) = self.wgpu_texture.as_ref() {
             backend.queue.write_texture(
@@ -532,6 +597,180 @@ impl Player {
 
     fn current_clock_us(&self) -> i64 {
         self.shared.audio_clock_us.load(Ordering::Relaxed)
+    }
+
+    fn upload_wgpu_nv12(
+        &mut self,
+        backend: &WgpuBackend,
+        width: u32,
+        height: u32,
+        y_plane: &[u8],
+        uv_plane: &[u8],
+    ) {
+        let renderer = match self.yuv_renderer.as_ref() {
+            Some(r) => r.clone(),
+            None => return,
+        };
+        let uv_h = (height + 1) / 2;
+
+        // (Re)create state when the size changes.
+        let needs_new = match &self.nv12_state {
+            Some(s) => s.width != width || s.height != height,
+            None => true,
+        };
+        if needs_new {
+            let y_texture = backend.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("nv12_y_texture"),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::R8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let uv_texture = backend.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("nv12_uv_texture"),
+                size: wgpu::Extent3d {
+                    width: width / 2,
+                    height: uv_h,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rg8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let y_view = y_texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let uv_view = uv_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+            let uniform_buffer = Arc::new(backend.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("nv12_uniform"),
+                size: std::mem::size_of::<[f32; 8]>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }));
+
+            let bind_group = Arc::new(backend.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("nv12_bind_group"),
+                layout: &renderer.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: uniform_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&y_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&uv_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Sampler(&renderer.sampler),
+                    },
+                ],
+            }));
+
+            self.nv12_state = Some(Nv12GpuState {
+                y_texture,
+                uv_texture,
+                bind_group,
+                uniform_buffer,
+                width,
+                height,
+            });
+        }
+        let state = match self.nv12_state.as_ref() {
+            Some(s) => s,
+            None => return,
+        };
+
+        // Upload Y plane.
+        backend.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &state.y_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            y_plane,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(width),
+                rows_per_image: Some(height),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        // Upload UV plane.
+        backend.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &state.uv_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            uv_plane,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(width), // Rg8 × (width/2) = width bytes
+                rows_per_image: Some(uv_h),
+            },
+            wgpu::Extent3d {
+                width: width / 2,
+                height: uv_h,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    /// Emit an `egui_wgpu::Callback` that will draw the current NV12
+    /// video frame into `rect` on the egui painter. Returns `None`
+    /// if the player is not currently on the NV12 path or the state
+    /// hasn't been initialized yet (e.g., before the first frame).
+    pub fn nv12_paint_callback(
+        &self,
+        screen_rect: egui::Rect,
+        video_rect: egui::Rect,
+        uv_rect: [f32; 4],
+    ) -> Option<egui::epaint::PaintCallback> {
+        let renderer = self.yuv_renderer.as_ref()?;
+        let state = self.nv12_state.as_ref()?;
+
+        let sw = screen_rect.width().max(1.0);
+        let sh = screen_rect.height().max(1.0);
+        let ndc_x = (video_rect.left() - screen_rect.left()) / sw * 2.0 - 1.0;
+        let ndc_y = 1.0 - (video_rect.top() - screen_rect.top()) / sh * 2.0;
+        let ndc_w = video_rect.width() / sw * 2.0;
+        let ndc_h = -(video_rect.height() / sh * 2.0);
+
+        let cb = Nv12PaintCallback {
+            pipeline: renderer.pipeline.clone(),
+            bind_group: state.bind_group.clone(),
+            uniform_buffer: state.uniform_buffer.clone(),
+            uniform_data: [
+                ndc_x, ndc_y, ndc_w, ndc_h, uv_rect[0], uv_rect[1], uv_rect[2], uv_rect[3],
+            ],
+        };
+
+        Some(egui::epaint::PaintCallback {
+            rect: video_rect,
+            callback: std::sync::Arc::new(egui_wgpu::Callback::new_paint_callback(
+                video_rect, cb,
+            )),
+        })
     }
 }
 
@@ -996,6 +1235,50 @@ fn video_decode_loop(
             let src_w = source_frame.width();
             let src_h = source_frame.height();
 
+            // NV12 fast path: skip swscale and pass Y + UV planes
+            // straight through. The GPU does YUV→RGB conversion in
+            // the fragment shader. Typically hit after HW decode
+            // because `av_hwframe_transfer_data` produces NV12 on
+            // CPU.
+            if src_fmt == ffmpeg::format::Pixel::NV12 {
+                let y_stride = source_frame.stride(0);
+                let uv_stride = source_frame.stride(1);
+                let y_src = source_frame.data(0);
+                let uv_src = source_frame.data(1);
+                let y_row = src_w as usize;
+                let uv_row = src_w as usize; // interleaved UV: 2 bytes per pixel at half width = src_w
+                let uv_h = (src_h as usize + 1) / 2;
+                let mut y_plane: Vec<u8> = Vec::with_capacity(y_row * src_h as usize);
+                let mut uv_plane: Vec<u8> = Vec::with_capacity(uv_row * uv_h);
+                if y_stride == y_row {
+                    y_plane.extend_from_slice(&y_src[..y_row * src_h as usize]);
+                } else {
+                    for y in 0..src_h as usize {
+                        let s = y * y_stride;
+                        y_plane.extend_from_slice(&y_src[s..s + y_row]);
+                    }
+                }
+                if uv_stride == uv_row {
+                    uv_plane.extend_from_slice(&uv_src[..uv_row * uv_h]);
+                } else {
+                    for y in 0..uv_h {
+                        let s = y * uv_stride;
+                        uv_plane.extend_from_slice(&uv_src[s..s + uv_row]);
+                    }
+                }
+                shared.video_queue.lock().unwrap().push_back(VideoFrame {
+                    pts_us,
+                    payload: VideoFramePayload::Nv12 {
+                        width: src_w,
+                        height: src_h,
+                        y_plane,
+                        uv_plane,
+                    },
+                });
+                egui_ctx.request_repaint();
+                continue;
+            }
+
             // Decide whether this frame should go through the 16-bit
             // path: feature enabled AND the source is actually a
             // 10-bit-or-higher pixel format worth preserving.
@@ -1107,6 +1390,270 @@ fn video_decode_loop(
             });
             egui_ctx.request_repaint();
         }
+    }
+}
+
+// =========================================================================
+// NV12 YUV → RGB custom render pipeline (partial Phase E)
+// =========================================================================
+
+/// WGSL shader for NV12 sampling: full-screen-quad vertex shader with
+/// a user-specified NDC rect, fragment shader that samples Y + UV,
+/// applies BT.709 limited-range YUV→R'G'B', decodes sRGB gamma, and
+/// outputs linear RGB (the swapchain's sRGB-encoded target will
+/// re-encode on store).
+const NV12_SHADER_SRC: &str = r#"
+struct Uniforms {
+    ndc_rect: vec4<f32>,
+    uv_rect:  vec4<f32>,
+};
+
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var y_tex: texture_2d<f32>;
+@group(0) @binding(2) var uv_tex: texture_2d<f32>;
+@group(0) @binding(3) var samp: sampler;
+
+struct VsOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) idx: u32) -> VsOut {
+    var quad = array<vec2<f32>, 6>(
+        vec2<f32>(0.0, 0.0),
+        vec2<f32>(1.0, 0.0),
+        vec2<f32>(1.0, 1.0),
+        vec2<f32>(0.0, 0.0),
+        vec2<f32>(1.0, 1.0),
+        vec2<f32>(0.0, 1.0),
+    );
+    let p = quad[idx];
+    var out: VsOut;
+    out.pos = vec4<f32>(
+        u.ndc_rect.x + u.ndc_rect.z * p.x,
+        u.ndc_rect.y + u.ndc_rect.w * p.y,
+        0.0,
+        1.0,
+    );
+    out.uv = vec2<f32>(
+        u.uv_rect.x + (u.uv_rect.z - u.uv_rect.x) * p.x,
+        u.uv_rect.y + (u.uv_rect.w - u.uv_rect.y) * p.y,
+    );
+    return out;
+}
+
+fn srgb_to_linear(c: f32) -> f32 {
+    if (c <= 0.04045) {
+        return c / 12.92;
+    }
+    return pow((c + 0.055) / 1.055, 2.4);
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let y  = textureSample(y_tex,  samp, in.uv).r;
+    let uv = textureSample(uv_tex, samp, in.uv).rg;
+
+    // BT.709 limited-range YUV (all channels normalized to [0,1])
+    let y_lin = 1.164 * (y - 0.0627);
+    let u_off = uv.r - 0.502;
+    let v_off = uv.g - 0.502;
+    let r_g = clamp(y_lin + 1.793 * v_off, 0.0, 1.0);
+    let g_g = clamp(y_lin - 0.213 * u_off - 0.533 * v_off, 0.0, 1.0);
+    let b_g = clamp(y_lin + 2.112 * u_off, 0.0, 1.0);
+
+    // Gamma decode to linear so the sRGB swapchain encodes correctly
+    // on store.
+    return vec4<f32>(
+        srgb_to_linear(r_g),
+        srgb_to_linear(g_g),
+        srgb_to_linear(b_g),
+        1.0,
+    );
+}
+"#;
+
+struct YuvRenderer {
+    pipeline: Arc<wgpu::RenderPipeline>,
+    bind_group_layout: Arc<wgpu::BindGroupLayout>,
+    sampler: Arc<wgpu::Sampler>,
+}
+
+impl Clone for YuvRenderer {
+    fn clone(&self) -> Self {
+        Self {
+            pipeline: self.pipeline.clone(),
+            bind_group_layout: self.bind_group_layout.clone(),
+            sampler: self.sampler.clone(),
+        }
+    }
+}
+
+impl YuvRenderer {
+    fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("nv12_shader"),
+            source: wgpu::ShaderSource::Wgsl(NV12_SHADER_SRC.into()),
+        });
+
+        let bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("nv12_bind_group_layout"),
+                entries: &[
+                    // uniform buffer (ndc_rect + uv_rect)
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    // Y plane texture
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    // UV plane texture
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    // sampler
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("nv12_pipeline_layout"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("nv12_pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("nv12_sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            ..Default::default()
+        });
+
+        Self {
+            pipeline: Arc::new(pipeline),
+            bind_group_layout: Arc::new(bind_group_layout),
+            sampler: Arc::new(sampler),
+        }
+    }
+}
+
+/// Per-video NV12 texture state: the Y plane texture, the UV plane
+/// texture, and the bind group that binds them (plus a uniform
+/// buffer) to the `YuvRenderer` pipeline.
+struct Nv12GpuState {
+    y_texture: wgpu::Texture,
+    uv_texture: wgpu::Texture,
+    bind_group: Arc<wgpu::BindGroup>,
+    uniform_buffer: Arc<wgpu::Buffer>,
+    width: u32,
+    height: u32,
+}
+
+/// Per-frame PaintCallback that runs inside egui_wgpu's render pass
+/// to draw the NV12 video. Holds cheap Arc-clones of the pipeline and
+/// bind group plus the NDC quad coordinates for the video area.
+struct Nv12PaintCallback {
+    pipeline: Arc<wgpu::RenderPipeline>,
+    bind_group: Arc<wgpu::BindGroup>,
+    uniform_buffer: Arc<wgpu::Buffer>,
+    /// Uniform data layout: [ndc_x, ndc_y, ndc_w, ndc_h, uv_x0, uv_y0, uv_x1, uv_y1]
+    uniform_data: [f32; 8],
+}
+
+impl egui_wgpu::CallbackTrait for Nv12PaintCallback {
+    fn prepare(
+        &self,
+        _device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        _screen_descriptor: &egui_wgpu::ScreenDescriptor,
+        _egui_encoder: &mut wgpu::CommandEncoder,
+        _callback_resources: &mut egui_wgpu::CallbackResources,
+    ) -> Vec<wgpu::CommandBuffer> {
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                self.uniform_data.as_ptr() as *const u8,
+                std::mem::size_of::<[f32; 8]>(),
+            )
+        };
+        queue.write_buffer(&self.uniform_buffer, 0, bytes);
+        Vec::new()
+    }
+
+    fn paint(
+        &self,
+        _info: egui::PaintCallbackInfo,
+        render_pass: &mut wgpu::RenderPass<'static>,
+        _callback_resources: &egui_wgpu::CallbackResources,
+    ) {
+        render_pass.set_pipeline(&self.pipeline);
+        render_pass.set_bind_group(0, &self.bind_group, &[]);
+        render_pass.draw(0..6, 0..1);
     }
 }
 

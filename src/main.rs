@@ -508,6 +508,7 @@ impl PhotoViewer {
                 device: rs.device.clone(),
                 queue: rs.queue.clone(),
                 renderer: rs.renderer.clone(),
+                target_format: rs.target_format,
                 supports_16bit_norm,
             }
         });
@@ -1108,7 +1109,13 @@ impl eframe::App for PhotoViewer {
 
                     // Scale video to fit while maintaining aspect ratio
                     // For 90/270 rotation, swap the video dimensions for aspect ratio calc
-                    let (src_w, src_h) = player.size();
+                    let (decl_w, decl_h) = player.size();
+                    let (intr_w, intr_h) = player.intrinsic_size();
+                    let (src_w, src_h) = if intr_w > 0 && intr_h > 0 {
+                        (intr_w, intr_h)
+                    } else {
+                        (decl_w, decl_h)
+                    };
                     let video_size = egui::vec2(src_w as f32, src_h as f32);
                     let (effective_w, effective_h) = if self.video_rotation == 90 || self.video_rotation == 270 {
                         (video_size.y, video_size.x)
@@ -1134,7 +1141,21 @@ impl eframe::App for PhotoViewer {
 
                     // Render via painter directly (not render_frame_at) so our
                     // click interaction isn't consumed by an internal widget.
-                    if let Some(texture_id) = player.texture_id() {
+                    if player.is_nv12_path() {
+                        // Partial Phase E: custom wgpu pipeline that
+                        // samples Y + UV and does YUV→RGB in the
+                        // fragment shader. Rotation is not yet
+                        // supported on this path; for rotated video
+                        // fall back briefly to RGBA.
+                        let screen = ctx.screen_rect();
+                        if let Some(cb) = player.nv12_paint_callback(
+                            screen,
+                            video_rect,
+                            [0.0, 0.0, 1.0, 1.0],
+                        ) {
+                            ui.painter().add(egui::Shape::Callback(cb));
+                        }
+                    } else if let Some(texture_id) = player.texture_id() {
                         if self.video_rotation == 0 {
                             ui.painter().image(
                                 texture_id,
