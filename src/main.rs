@@ -415,6 +415,27 @@ fn main() -> eframe::Result<()> {
         // CreationContext and manage our own video textures / custom
         // render callbacks downstream.
         renderer: eframe::Renderer::Wgpu,
+        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+            // Override eframe's default device descriptor so we can
+            // request optional features. `TEXTURE_FORMAT_16BIT_NORM`
+            // is needed for the 10-bit HEVC playback path to upload
+            // directly to an `Rgba16Unorm` texture.
+            device_descriptor: std::sync::Arc::new(|adapter| {
+                let wanted = eframe::wgpu::Features::TEXTURE_FORMAT_16BIT_NORM;
+                let required_features = if adapter.features().contains(wanted) {
+                    wanted
+                } else {
+                    eframe::wgpu::Features::empty()
+                };
+                eframe::wgpu::DeviceDescriptor {
+                    label: Some("fast-photo-viewer"),
+                    required_features,
+                    required_limits: eframe::wgpu::Limits::default(),
+                    memory_hints: eframe::wgpu::MemoryHints::default(),
+                }
+            }),
+            ..Default::default()
+        },
         ..Default::default()
     };
 
@@ -479,10 +500,15 @@ struct PhotoViewer {
 impl PhotoViewer {
     fn new(cc: &eframe::CreationContext<'_>, initial_file: Option<PathBuf>) -> Self {
         let wgpu_backend = cc.wgpu_render_state.as_ref().map(|rs| {
+            let supports_16bit_norm = rs
+                .device
+                .features()
+                .contains(eframe::wgpu::Features::TEXTURE_FORMAT_16BIT_NORM);
             video_player::WgpuBackend {
                 device: rs.device.clone(),
                 queue: rs.queue.clone(),
                 renderer: rs.renderer.clone(),
+                supports_16bit_norm,
             }
         });
         Self {

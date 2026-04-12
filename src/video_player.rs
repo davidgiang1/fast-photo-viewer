@@ -47,12 +47,27 @@ pub enum PlayerState {
     Error,
 }
 
+enum VideoFramePayload {
+    /// 8-bit sRGB RGBA, stored as a pre-built ColorImage so the main
+    /// thread can hand it directly to egui in the fallback path.
+    Rgba8Srgb {
+        width: u32,
+        height: u32,
+        image: egui::ColorImage,
+    },
+    /// 16-bit linear RGBA (u16 per channel little-endian), matching
+    /// wgpu's `Rgba16Unorm` byte layout on x86. Used only on the
+    /// direct-wgpu path and only when the source is 10-bit.
+    Rgba16Unorm {
+        width: u32,
+        height: u32,
+        bytes: Vec<u8>,
+    },
+}
+
 struct VideoFrame {
     pts_us: i64,
-    /// Pre-built ColorImage ready for direct handoff to egui. Built on
-    /// the decode worker thread so the main thread's `tick()` only has
-    /// to move ownership — no per-pixel work happens on the UI path.
-    image: egui::ColorImage,
+    payload: VideoFramePayload,
 }
 
 enum Command {
@@ -106,6 +121,10 @@ pub struct WgpuBackend {
     pub device: Arc<wgpu::Device>,
     pub queue: Arc<wgpu::Queue>,
     pub renderer: Arc<egui::mutex::RwLock<egui_wgpu::Renderer>>,
+    /// True when the wgpu device was created with the
+    /// `TEXTURE_FORMAT_16BIT_NORM` feature, which gates use of
+    /// `Rgba16Unorm` textures for our 10-bit source path.
+    pub supports_16bit_norm: bool,
 }
 
 pub struct Player {
@@ -119,6 +138,7 @@ pub struct Player {
     wgpu_texture: Option<wgpu::Texture>,
     wgpu_texture_id: Option<egui::TextureId>,
     wgpu_texture_size: (u32, u32),
+    wgpu_texture_format: Option<wgpu::TextureFormat>,
     egui_ctx: egui::Context,
     last_uploaded_pts_us: i64,
     /// Wall-clock fallback: when the file has no audio, we advance the
@@ -175,6 +195,10 @@ impl Player {
 
         let (cmd_tx, cmd_rx) = mpsc::channel::<Command>();
 
+        let high_bit_depth_enabled = wgpu
+            .as_ref()
+            .map(|b| b.supports_16bit_norm)
+            .unwrap_or(false);
         let shared_for_thread = shared.clone();
         let ctx_for_thread = ctx.clone();
         let path_for_thread = path.to_path_buf();
@@ -186,6 +210,7 @@ impl Player {
                 audio_producer,
                 ctx_for_thread,
                 target_rate,
+                high_bit_depth_enabled,
             ) {
                 let mut state = shared_for_thread.state.lock().unwrap();
                 state.player_state = PlayerState::Error;
@@ -228,6 +253,7 @@ impl Player {
             wgpu_texture: None,
             wgpu_texture_id: None,
             wgpu_texture_size: (0, 0),
+            wgpu_texture_format: None,
             egui_ctx: ctx.clone(),
             last_uploaded_pts_us: i64::MIN,
             no_audio_clock_origin: None,
@@ -364,9 +390,19 @@ impl Player {
         if let Some(frame) = best {
             if frame.pts_us != self.last_uploaded_pts_us {
                 if self.wgpu.is_some() {
-                    self.upload_wgpu(&frame);
+                    self.upload_wgpu(frame.payload);
                 } else {
-                    self.upload_egui(frame.image);
+                    match frame.payload {
+                        VideoFramePayload::Rgba8Srgb { image, .. } => {
+                            self.upload_egui(image);
+                        }
+                        VideoFramePayload::Rgba16Unorm { .. } => {
+                            // 16-bit path is never chosen without a
+                            // wgpu backend — the decode thread gates
+                            // on `high_bit_depth_enabled` which is
+                            // false when `wgpu` is None.
+                        }
+                    }
                 }
                 self.last_uploaded_pts_us = frame.pts_us;
             }
@@ -392,17 +428,35 @@ impl Player {
         }
     }
 
-    fn upload_wgpu(&mut self, frame: &VideoFrame) {
+    fn upload_wgpu(&mut self, payload: VideoFramePayload) {
         let backend = match self.wgpu.as_ref() {
             Some(b) => b.clone(),
             None => return,
         };
-        let width = frame.image.size[0] as u32;
-        let height = frame.image.size[1] as u32;
 
-        // (Re)create the wgpu texture when the size changes (first
-        // frame or aspect ratio flip between videos).
-        if self.wgpu_texture.is_none() || self.wgpu_texture_size != (width, height) {
+        let (width, height, wgpu_format, bytes_per_pixel): (u32, u32, wgpu::TextureFormat, u32) =
+            match &payload {
+                VideoFramePayload::Rgba8Srgb { width, height, .. } => (
+                    *width,
+                    *height,
+                    wgpu::TextureFormat::Rgba8UnormSrgb,
+                    4,
+                ),
+                VideoFramePayload::Rgba16Unorm { width, height, .. } => (
+                    *width,
+                    *height,
+                    wgpu::TextureFormat::Rgba16Unorm,
+                    8,
+                ),
+            };
+
+        // (Re)create the wgpu texture on the first frame, when the
+        // aspect ratio changes, or when the pixel format changes
+        // (e.g. switching from an 8-bit to a 10-bit video).
+        let needs_new_texture = self.wgpu_texture.is_none()
+            || self.wgpu_texture_size != (width, height)
+            || self.wgpu_texture_format != Some(wgpu_format);
+        if needs_new_texture {
             let tex = backend.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("video_player_frame"),
                 size: wgpu::Extent3d {
@@ -413,7 +467,7 @@ impl Player {
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                format: wgpu_format,
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             });
@@ -439,14 +493,19 @@ impl Player {
             self.wgpu_texture = Some(tex);
             self.wgpu_texture_id = Some(new_id);
             self.wgpu_texture_size = (width, height);
+            self.wgpu_texture_format = Some(wgpu_format);
         }
 
-        // Upload the RGBA bytes directly into the texture. ColorImage
-        // stores pixels as Vec<Color32>, which is repr(C) [u8; 4] —
-        // safe to reinterpret as a flat &[u8].
-        let pixels = &frame.image.pixels;
-        let bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(pixels.as_ptr() as *const u8, pixels.len() * 4)
+        // Reinterpret the frame payload as a flat byte slice and
+        // write it straight into the wgpu texture.
+        let bytes: &[u8] = match &payload {
+            VideoFramePayload::Rgba8Srgb { image, .. } => unsafe {
+                std::slice::from_raw_parts(
+                    image.pixels.as_ptr() as *const u8,
+                    image.pixels.len() * 4,
+                )
+            },
+            VideoFramePayload::Rgba16Unorm { bytes, .. } => bytes.as_slice(),
         };
         if let Some(tex) = self.wgpu_texture.as_ref() {
             backend.queue.write_texture(
@@ -459,7 +518,7 @@ impl Player {
                 bytes,
                 wgpu::ImageDataLayout {
                     offset: 0,
-                    bytes_per_row: Some(width * 4),
+                    bytes_per_row: Some(width * bytes_per_pixel),
                     rows_per_image: Some(height),
                 },
                 wgpu::Extent3d {
@@ -575,6 +634,7 @@ fn run_decode_pipeline(
     audio_producer: <HeapRb<f32> as Split>::Prod,
     egui_ctx: egui::Context,
     target_rate: u32,
+    high_bit_depth_enabled: bool,
 ) -> Result<(), String> {
     let mut ictx =
         ffmpeg::format::input(&path).map_err(|e| format!("open: {}", e))?;
@@ -684,7 +744,14 @@ fn run_decode_pipeline(
         let shared_c = shared.clone();
         let ctx_c = egui_ctx.clone();
         thread::spawn(move || {
-            video_decode_loop(video_decoder, video_time_base, video_rx, shared_c, ctx_c);
+            video_decode_loop(
+                video_decoder,
+                video_time_base,
+                video_rx,
+                shared_c,
+                ctx_c,
+                high_bit_depth_enabled,
+            );
         })
     };
     let audio_handle = match (audio_decoder, audio_resampler, audio_rx_opt) {
@@ -875,12 +942,15 @@ fn video_decode_loop(
     rx: Receiver<DecodeMsg>,
     shared: Arc<Shared>,
     egui_ctx: egui::Context,
+    high_bit_depth_enabled: bool,
 ) {
     let mut video_frame = ffmpeg::frame::Video::empty();
     let mut rgba_frame = ffmpeg::frame::Video::empty();
     let mut sw_frame = ffmpeg::frame::Video::empty();
     let mut video_scaler: Option<ffmpeg::software::scaling::context::Context> = None;
-    let mut scaler_cfg: Option<(ffmpeg::format::Pixel, u32, u32)> = None;
+    // cfg is (src_fmt, src_w, src_h, output_is_16bit) so a transition
+    // between 8- and 16-bit output forces a scaler rebuild.
+    let mut scaler_cfg: Option<(ffmpeg::format::Pixel, u32, u32, bool)> = None;
     loop {
         let msg = match rx.recv() {
             Ok(m) => m,
@@ -926,6 +996,17 @@ fn video_decode_loop(
             let src_w = source_frame.width();
             let src_h = source_frame.height();
 
+            // Decide whether this frame should go through the 16-bit
+            // path: feature enabled AND the source is actually a
+            // 10-bit-or-higher pixel format worth preserving.
+            let use_16bit = high_bit_depth_enabled && is_high_bit_depth_format(src_fmt);
+            let dst_fmt = if use_16bit {
+                ffmpeg::format::Pixel::RGBA64LE
+            } else {
+                ffmpeg::format::Pixel::RGBA
+            };
+            let bytes_per_pixel: usize = if use_16bit { 8 } else { 4 };
+
             // Cap output width to keep the RGBA buffer small and
             // texture uploads cheap. 1920-wide is enough for most
             // displays — scaling up to fit on the egui side uses GPU
@@ -940,7 +1021,7 @@ fn video_decode_loop(
                 (src_w, src_h)
             };
 
-            let cfg = (src_fmt, src_w, src_h);
+            let cfg = (src_fmt, src_w, src_h, use_16bit);
             if scaler_cfg != Some(cfg) {
                 let flags = ffmpeg::software::scaling::flag::Flags::BILINEAR
                     | ffmpeg::software::scaling::flag::Flags::ACCURATE_RND
@@ -950,7 +1031,7 @@ fn video_decode_loop(
                     src_fmt,
                     src_w,
                     src_h,
-                    ffmpeg::format::Pixel::RGBA,
+                    dst_fmt,
                     dst_w,
                     dst_h,
                     flags,
@@ -977,10 +1058,8 @@ fn video_decode_loop(
             let h = rgba_frame.height();
             let stride = rgba_frame.stride(0);
             let src = rgba_frame.data(0);
-            let row = w as usize * 4;
+            let row = w as usize * bytes_per_pixel;
             let total = row * h as usize;
-            // Single memcpy fast path when swscale produced a tight
-            // buffer (stride == row), else row-by-row.
             let mut pixels: Vec<u8> = Vec::with_capacity(total);
             if stride == row {
                 pixels.extend_from_slice(&src[..total]);
@@ -991,31 +1070,62 @@ fn video_decode_loop(
                 }
             }
 
-            // Transmute Vec<u8> -> Vec<Color32> without touching the
-            // pixel bytes. Safe because Color32 is #[repr(C)] [u8; 4]
-            // with the same alignment (1) as u8, the byte count is a
-            // multiple of 4, and we immediately forget the original.
-            let color_pixels: Vec<egui::Color32> = unsafe {
-                debug_assert!(pixels.len() % 4 == 0);
-                debug_assert!(pixels.capacity() % 4 == 0);
-                let len = pixels.len() / 4;
-                let cap = pixels.capacity() / 4;
-                let ptr = pixels.as_mut_ptr() as *mut egui::Color32;
-                std::mem::forget(pixels);
-                Vec::from_raw_parts(ptr, len, cap)
-            };
-            let image = egui::ColorImage {
-                size: [w as usize, h as usize],
-                pixels: color_pixels,
+            let payload = if use_16bit {
+                VideoFramePayload::Rgba16Unorm {
+                    width: w,
+                    height: h,
+                    bytes: pixels,
+                }
+            } else {
+                // Transmute Vec<u8> -> Vec<Color32> without touching
+                // the pixel bytes. Safe: Color32 is #[repr(C)] [u8; 4]
+                // with alignment 1, same as u8, byte count multiple
+                // of 4.
+                let color_pixels: Vec<egui::Color32> = unsafe {
+                    debug_assert!(pixels.len() % 4 == 0);
+                    debug_assert!(pixels.capacity() % 4 == 0);
+                    let len = pixels.len() / 4;
+                    let cap = pixels.capacity() / 4;
+                    let ptr = pixels.as_mut_ptr() as *mut egui::Color32;
+                    std::mem::forget(pixels);
+                    Vec::from_raw_parts(ptr, len, cap)
+                };
+                let image = egui::ColorImage {
+                    size: [w as usize, h as usize],
+                    pixels: color_pixels,
+                };
+                VideoFramePayload::Rgba8Srgb {
+                    width: w,
+                    height: h,
+                    image,
+                }
             };
 
             shared.video_queue.lock().unwrap().push_back(VideoFrame {
                 pts_us,
-                image,
+                payload,
             });
             egui_ctx.request_repaint();
         }
     }
+}
+
+fn is_high_bit_depth_format(fmt: ffmpeg::format::Pixel) -> bool {
+    use ffmpeg::format::Pixel::*;
+    matches!(
+        fmt,
+        YUV420P10LE | YUV420P10BE
+        | YUV422P10LE | YUV422P10BE
+        | YUV444P10LE | YUV444P10BE
+        | YUV420P12LE | YUV420P12BE
+        | YUV422P12LE | YUV422P12BE
+        | YUV444P12LE | YUV444P12BE
+        | YUV420P16LE | YUV420P16BE
+        | YUV422P16LE | YUV422P16BE
+        | YUV444P16LE | YUV444P16BE
+        | P010LE | P010BE
+        | P016LE | P016BE
+    )
 }
 
 /// Audio decode worker: pulls DecodeMsg, decodes, resamples, pushes
