@@ -17,3 +17,12 @@ walkdir = "2"
 rand = "0.8"
 rfd = "0.15"
 ffmpeg-the-third = "2.0"
+rawloader = "0.37"
+imagepipe = "0.5"
+
+# Patched locally: upstream 2.0.1 panics in
+# software::resampling::context::Context::get_with2 when the source audio
+# stream has ChannelOrder::Unspecified / Custom (common in iPhone AAC),
+# because ChannelLayout::mask() returns None and the crate unwraps it.
+[patch.crates-io]
+ffmpeg-the-third = { path = "vendor/ffmpeg-the-third" }

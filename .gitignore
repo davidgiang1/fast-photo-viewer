@@ -8,3 +8,6 @@
 /output
 *.7z
 *.zip
+*.log
+# Ignore build output inside the vendored crate, keep the source
+vendor/**/target

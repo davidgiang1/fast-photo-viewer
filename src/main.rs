@@ -15,7 +15,31 @@ use ffmpeg_the_third as ffmpeg;
 
 const IMAGE_EXTENSIONS: &[&str] = &[
     "jpg", "jpeg", "png", "bmp", "webp", "gif", "tiff", "ico", "svg",
+    // HEIF family (decoded via ffmpeg)
+    "heic", "heif", "avif",
+    // Camera raw (decoded via rawloader + imagepipe)
+    "nef", "nrw", "cr2", "arw", "srf", "sr2", "dng", "raf",
+    "rw2", "orf", "pef", "srw", "3fr", "mrw", "iiq", "kdc",
+    "dcr", "rwl", "x3f", "mef", "mos",
 ];
+
+const RAW_EXTENSIONS: &[&str] = &[
+    "nef", "nrw", "cr2", "arw", "srf", "sr2", "dng", "raf",
+    "rw2", "orf", "pef", "srw", "3fr", "mrw", "iiq", "kdc",
+    "dcr", "rwl", "x3f", "mef", "mos",
+];
+
+const HEIF_EXTENSIONS: &[&str] = &["heic", "heif", "avif"];
+
+fn has_ext(path: &Path, exts: &[&str]) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|ext| exts.contains(&ext.to_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+fn is_raw_file(path: &Path) -> bool { has_ext(path, RAW_EXTENSIONS) }
+fn is_heif_file(path: &Path) -> bool { has_ext(path, HEIF_EXTENSIONS) }
 
 const VIDEO_EXTENSIONS: &[&str] = &[
     "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v",
@@ -43,6 +67,28 @@ impl MediaFilter {
             MediaFilter::All => MediaFilter::ImagesOnly,
             MediaFilter::ImagesOnly => MediaFilter::VideosOnly,
             MediaFilter::VideosOnly => MediaFilter::All,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ViewOrder {
+    Random,
+    Ordered,
+}
+
+impl ViewOrder {
+    fn label(self) -> &'static str {
+        match self {
+            ViewOrder::Random => "Random",
+            ViewOrder::Ordered => "Ordered",
+        }
+    }
+
+    fn toggle(self) -> Self {
+        match self {
+            ViewOrder::Random => ViewOrder::Ordered,
+            ViewOrder::Ordered => ViewOrder::Random,
         }
     }
 }
@@ -79,6 +125,276 @@ fn file_has_audio_stream(path: &Path) -> bool {
         Ok(ctx) => ctx.streams().any(|s| s.parameters().medium() == ffmpeg::media::Type::Audio),
         Err(_) => true, // Assume audio if probe fails
     }
+}
+
+/// Scan a byte slice for the largest embedded JPEG (SOI..EOI). Works
+/// because within a valid JPEG payload, any `0xFF` byte is followed by
+/// `0x00` (stuff byte), so `FF D9` only appears as a real end-of-image.
+fn find_largest_embedded_jpeg(data: &[u8]) -> Option<&[u8]> {
+    let mut best: Option<&[u8]> = None;
+    let mut i = 0;
+    while i + 2 < data.len() {
+        if data[i] == 0xFF && data[i + 1] == 0xD8 && data[i + 2] == 0xFF {
+            let mut j = i + 2;
+            while j + 1 < data.len() {
+                if data[j] == 0xFF && data[j + 1] == 0xD9 {
+                    let slice = &data[i..j + 2];
+                    if best.map_or(true, |b| slice.len() > b.len()) {
+                        best = Some(slice);
+                    }
+                    i = j + 2;
+                    break;
+                }
+                j += 1;
+            }
+            if j + 1 >= data.len() {
+                break;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    best
+}
+
+/// Decode a camera RAW file (NEF, CR2, ARW, DNG, etc.) to an sRGB image.
+/// Fast path: extract the full-resolution JPEG preview every modern
+/// camera embeds. Fallback: full rawloader + imagepipe demosaic (slow,
+/// and only works for camera models in rawloader's database).
+fn decode_raw_image(path: &Path) -> Result<DynamicImage, String> {
+    if let Ok(bytes) = fs::read(path) {
+        if let Some(jpeg) = find_largest_embedded_jpeg(&bytes) {
+            // Require at least 64 KB so we don't pick up a tiny thumbnail
+            // when a larger preview exists further in the file.
+            if jpeg.len() >= 64 * 1024 {
+                if let Ok(img) = image::load_from_memory(jpeg) {
+                    return Ok(img);
+                }
+            }
+        }
+    }
+
+    // Fallback: full raw decode via rawloader + imagepipe.
+    let mut pipeline = imagepipe::Pipeline::new_from_file(path)
+        .map_err(|e| format!("raw open: {:?}", e))?;
+    let decoded = pipeline
+        .output_8bit(None)
+        .map_err(|e| format!("raw pipeline: {:?}", e))?;
+    let buf = image::RgbImage::from_raw(
+        decoded.width as u32,
+        decoded.height as u32,
+        decoded.data,
+    )
+    .ok_or_else(|| "raw: buffer size mismatch".to_string())?;
+    Ok(DynamicImage::ImageRgb8(buf))
+}
+
+/// Extract `count` evenly-spaced thumbnail frames from a video for use
+/// as a seek preview strip. Runs on a background thread; writes each
+/// thumbnail into `out[i]` as an egui::ColorImage and requests a repaint
+/// so the UI can lazy-upload new textures.
+fn extract_seek_thumbnails(
+    path: PathBuf,
+    count: usize,
+    out: Arc<Mutex<Vec<Option<egui::ColorImage>>>>,
+    ctx: egui::Context,
+) {
+    let mut ictx = match ffmpeg::format::input(&path) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let (stream_index, src_w, src_h, src_format, params) = {
+        let Some(stream) = ictx.streams().best(ffmpeg::media::Type::Video) else {
+            return;
+        };
+        let params = stream.parameters();
+        let decoder_ctx = match ffmpeg::codec::context::Context::from_parameters(params.clone()) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let decoder = match decoder_ctx.decoder().video() {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        (stream.index(), decoder.width(), decoder.height(), decoder.format(), params)
+    };
+
+    let decoder_ctx = match ffmpeg::codec::context::Context::from_parameters(params) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let mut decoder = match decoder_ctx.decoder().video() {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+
+    let thumb_w: u32 = 192;
+    let thumb_h: u32 = if src_w > 0 {
+        ((thumb_w as u64 * src_h as u64) / src_w as u64).max(1) as u32
+    } else {
+        108
+    };
+
+    let mut scaler = match ffmpeg::software::scaling::context::Context::get(
+        src_format,
+        src_w,
+        src_h,
+        ffmpeg::format::Pixel::RGBA,
+        thumb_w,
+        thumb_h,
+        ffmpeg::software::scaling::flag::Flags::BILINEAR,
+    ) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+
+    let duration = ictx.duration(); // AV_TIME_BASE units (microseconds)
+    if duration <= 0 {
+        return;
+    }
+
+    let mut frame = ffmpeg::frame::Video::empty();
+    let mut rgb = ffmpeg::frame::Video::empty();
+
+    for i in 0..count {
+        // Aim slightly past the start of each segment so we don't land
+        // exactly on a non-keyframe boundary.
+        let target = (duration as i128 * i as i128 / count as i128) as i64
+            + duration / (count as i64 * 4);
+        let _ = ictx.seek(target, ..target + duration / count as i64);
+        let _ = decoder.flush();
+
+        let mut got_frame = false;
+        let mut tries = 0usize;
+        for item in ictx.packets() {
+            tries += 1;
+            if tries > 200 {
+                break;
+            }
+            let (s, packet) = match item {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            if s.index() != stream_index {
+                continue;
+            }
+            if decoder.send_packet(&packet).is_err() {
+                continue;
+            }
+            if decoder.receive_frame(&mut frame).is_ok() {
+                got_frame = true;
+                break;
+            }
+        }
+        if !got_frame {
+            continue;
+        }
+
+        if scaler.run(&frame, &mut rgb).is_err() {
+            continue;
+        }
+
+        let w = rgb.width() as usize;
+        let h = rgb.height() as usize;
+        let stride = rgb.stride(0);
+        let src = rgb.data(0);
+        let row_bytes = w * 4;
+        let mut buf = Vec::with_capacity(row_bytes * h);
+        for y in 0..h {
+            let start = y * stride;
+            buf.extend_from_slice(&src[start..start + row_bytes]);
+        }
+        let color_image = egui::ColorImage::from_rgba_unmultiplied([w, h], &buf);
+
+        {
+            let mut o = out.lock().unwrap();
+            if i < o.len() {
+                o[i] = Some(color_image);
+            }
+        }
+        ctx.request_repaint();
+    }
+}
+
+/// Decode a single-frame HEIF/HEIC/AVIF image through ffmpeg. We treat
+/// the file as a one-frame video, decode the first frame, and convert
+/// to RGB24 via swscale.
+fn decode_heif_image(path: &Path) -> Result<DynamicImage, String> {
+    let mut ictx = ffmpeg::format::input(&path)
+        .map_err(|e| format!("heif open: {}", e))?;
+
+    let stream_index = ictx
+        .streams()
+        .best(ffmpeg::media::Type::Video)
+        .ok_or_else(|| "heif: no video stream".to_string())?
+        .index();
+
+    let params = ictx
+        .stream(stream_index)
+        .ok_or_else(|| "heif: missing stream".to_string())?
+        .parameters();
+    let decoder_ctx = ffmpeg::codec::context::Context::from_parameters(params)
+        .map_err(|e| format!("heif codec ctx: {}", e))?;
+    let mut decoder = decoder_ctx
+        .decoder()
+        .video()
+        .map_err(|e| format!("heif decoder: {}", e))?;
+
+    let mut scaler = ffmpeg::software::scaling::context::Context::get(
+        decoder.format(),
+        decoder.width(),
+        decoder.height(),
+        ffmpeg::format::Pixel::RGB24,
+        decoder.width(),
+        decoder.height(),
+        ffmpeg::software::scaling::flag::Flags::BILINEAR,
+    )
+    .map_err(|e| format!("heif scaler: {}", e))?;
+
+    let extract = |scaler: &mut ffmpeg::software::scaling::context::Context,
+                   frame: &ffmpeg::frame::Video|
+     -> Result<DynamicImage, String> {
+        let mut rgb = ffmpeg::frame::Video::empty();
+        scaler
+            .run(frame, &mut rgb)
+            .map_err(|e| format!("heif scale: {}", e))?;
+        let w = rgb.width();
+        let h = rgb.height();
+        let stride = rgb.stride(0);
+        let src = rgb.data(0);
+        let row_bytes = w as usize * 3;
+        let mut buf = Vec::with_capacity(row_bytes * h as usize);
+        for y in 0..h as usize {
+            let start = y * stride;
+            buf.extend_from_slice(&src[start..start + row_bytes]);
+        }
+        let img = image::RgbImage::from_raw(w, h, buf)
+            .ok_or_else(|| "heif: buffer size mismatch".to_string())?;
+        Ok(DynamicImage::ImageRgb8(img))
+    };
+
+    let mut frame = ffmpeg::frame::Video::empty();
+    for item in ictx.packets() {
+        let (stream, packet) = item.map_err(|e| format!("heif packet: {}", e))?;
+        if stream.index() != stream_index {
+            continue;
+        }
+        decoder
+            .send_packet(&packet)
+            .map_err(|e| format!("heif send: {}", e))?;
+        if decoder.receive_frame(&mut frame).is_ok() {
+            return extract(&mut scaler, &frame);
+        }
+    }
+
+    decoder
+        .send_eof()
+        .map_err(|e| format!("heif eof: {}", e))?;
+    if decoder.receive_frame(&mut frame).is_ok() {
+        return extract(&mut scaler, &frame);
+    }
+
+    Err("heif: no frame decoded".to_string())
 }
 
 fn main() -> eframe::Result<()> {
@@ -126,6 +442,17 @@ struct PhotoViewer {
     seek_frac: f32,
     video_rotation: u16,
 
+    // Scrubbing: while the user is dragging on the seek bar, we hold
+    // the target position here and only commit it to the player on
+    // release so the decoder isn't hammered every frame.
+    scrubbing: Option<f32>,
+
+    // YouTube-style preview thumbnails for the current video: the bg
+    // thread fills `seek_thumbs`, and the main thread lazily uploads
+    // each one into `seek_thumb_textures` the first time it's needed.
+    seek_thumbs: Arc<Mutex<Vec<Option<egui::ColorImage>>>>,
+    seek_thumb_textures: Vec<Option<egui::TextureHandle>>,
+
     // UI state
     last_esc_press: Option<std::time::Instant>,
 
@@ -139,6 +466,7 @@ struct PhotoViewer {
 
     // Filter
     media_filter: MediaFilter,
+    view_order: ViewOrder,
 
     is_scanning: Arc<Mutex<bool>>,
     scan_count: Arc<Mutex<usize>>,
@@ -162,12 +490,16 @@ impl PhotoViewer {
             video_has_audio: true,
             seek_frac: 0.0,
             video_rotation: 0,
+            scrubbing: None,
+            seek_thumbs: Arc::new(Mutex::new(Vec::new())),
+            seek_thumb_textures: Vec::new(),
             last_esc_press: None,
             history: Vec::new(),
             history_index: None,
             zoom: 1.0,
             pan: egui::Vec2::ZERO,
             media_filter: MediaFilter::All,
+            view_order: ViewOrder::Random,
             is_scanning: Arc::new(Mutex::new(false)),
             scan_count: Arc::new(Mutex::new(0)),
             texture: None,
@@ -234,6 +566,8 @@ impl PhotoViewer {
                     *count_clone.lock().unwrap() += 1;
                 }
             }
+            // Sort for deterministic ordered navigation
+            paths_clone.lock().unwrap().sort();
             *scanning_clone.lock().unwrap() = false;
         });
     }
@@ -245,6 +579,10 @@ impl PhotoViewer {
     }
 
     fn go_next(&mut self, ctx: &egui::Context) {
+        if self.view_order == ViewOrder::Ordered {
+            self.ordered_step(ctx, 1);
+            return;
+        }
         if let Some(idx) = self.history_index {
             // Look forward through history for a matching entry
             let mut next_idx = idx + 1;
@@ -264,6 +602,10 @@ impl PhotoViewer {
     }
 
     fn go_prev(&mut self, ctx: &egui::Context) {
+        if self.view_order == ViewOrder::Ordered {
+            self.ordered_step(ctx, -1);
+            return;
+        }
         if let Some(idx) = self.history_index {
             let mut prev_idx = idx;
             while prev_idx > 0 {
@@ -277,6 +619,41 @@ impl PhotoViewer {
                     return;
                 }
             }
+        }
+    }
+
+    /// Step through `media_paths` in sorted order by `delta` (+1 / -1),
+    /// skipping files that don't match the current media filter. Wraps
+    /// around at both ends.
+    fn ordered_step(&mut self, ctx: &egui::Context, delta: isize) {
+        let next_path = {
+            let paths = self.media_paths.lock().unwrap();
+            if paths.is_empty() {
+                return;
+            }
+            let n = paths.len();
+            let start = self
+                .current_media_path
+                .as_ref()
+                .and_then(|p| paths.iter().position(|mp| mp == p))
+                .map(|i| i as isize)
+                .unwrap_or(if delta > 0 { -1 } else { n as isize });
+
+            let mut found = None;
+            for step in 1..=n {
+                let idx = ((start + delta * step as isize).rem_euclid(n as isize)) as usize;
+                if matches_filter(&paths[idx], self.media_filter) {
+                    found = Some(paths[idx].clone());
+                    break;
+                }
+            }
+            found
+        };
+
+        if let Some(p) = next_path {
+            self.current_media_path = Some(p.clone());
+            self.reset_view();
+            self.load_media(p, ctx);
         }
     }
 
@@ -353,40 +730,77 @@ impl PhotoViewer {
         self.current_image = None;
         self.texture = None;
 
+        // Reset any in-flight scrub and preview thumbnails.
+        self.scrubbing = None;
+        self.seek_thumb_textures.clear();
+        const THUMB_COUNT: usize = 20;
+        {
+            let mut thumbs = self.seek_thumbs.lock().unwrap();
+            *thumbs = vec![None; THUMB_COUNT];
+        }
+        self.seek_thumb_textures.resize_with(THUMB_COUNT, || None);
+        {
+            let path_clone = path.clone();
+            let thumbs_clone = self.seek_thumbs.clone();
+            let ctx_clone = ctx.clone();
+            thread::spawn(move || {
+                extract_seek_thumbnails(path_clone, THUMB_COUNT, thumbs_clone, ctx_clone);
+            });
+        }
+
         // Probe file for audio streams before opening player
         self.video_has_audio = file_has_audio_stream(&path);
 
         let path_str = path.to_string_lossy().to_string();
-        match Player::new(ctx, &path_str) {
-            Ok(player) => {
-                match player.with_audio(&mut self.audio_device) {
-                    Ok(mut player) => {
-                        player.options.looping = self.video_looping;
-                        if self.video_has_audio {
-                            player.options.audio_volume.set(self.video_volume);
-                        }
-                        player.start();
-                        self.video_player = Some(player);
-                        self.is_video = true;
-                        self.seek_frac = 0.0;
-                        self.error_msg = None;
-                    }
-                    Err(e) => {
-                        // Try without audio
-                        println!("Audio init failed ({}), playing without audio", e);
-                        let mut player = Player::new(ctx, &path_str).unwrap();
-                        player.options.looping = self.video_looping;
-                        player.start();
-                        self.video_player = Some(player);
-                        self.is_video = true;
-                        self.video_has_audio = false;
-                        self.seek_frac = 0.0;
-                        self.error_msg = None;
-                    }
-                }
-            }
+        let initial_player = match Player::new(ctx, &path_str) {
+            Ok(p) => p,
             Err(e) => {
                 let msg = format!("Error loading video {}: {}", path.display(), e);
+                println!("{}", msg);
+                self.error_msg = Some(msg);
+                self.video_player = None;
+                self.is_video = false;
+                return;
+            }
+        };
+
+        // `with_audio` can panic inside ffmpeg-the-third when building a
+        // resampler for unusual channel layouts (e.g. some iPhone MOV files),
+        // so catch unwinds and fall back to silent playback.
+        let audio_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            initial_player.with_audio(&mut self.audio_device)
+        }));
+
+        let audio_err: String = match audio_result {
+            Ok(Ok(mut player)) => {
+                player.options.looping = self.video_looping;
+                if self.video_has_audio {
+                    player.options.audio_volume.set(self.video_volume);
+                }
+                player.start();
+                self.video_player = Some(player);
+                self.is_video = true;
+                self.seek_frac = 0.0;
+                self.error_msg = None;
+                return;
+            }
+            Ok(Err(e)) => e.to_string(),
+            Err(_) => "ffmpeg panicked during audio init (unsupported channel layout)".to_string(),
+        };
+
+        println!("Audio init failed ({}), playing without audio", audio_err);
+        match Player::new(ctx, &path_str) {
+            Ok(mut player) => {
+                player.options.looping = self.video_looping;
+                player.start();
+                self.video_player = Some(player);
+                self.is_video = true;
+                self.video_has_audio = false;
+                self.seek_frac = 0.0;
+                self.error_msg = None;
+            }
+            Err(e) => {
+                let msg = format!("Error loading video {} (no-audio fallback): {}", path.display(), e);
                 println!("{}", msg);
                 self.error_msg = Some(msg);
                 self.video_player = None;
@@ -400,11 +814,19 @@ impl PhotoViewer {
         self.video_player = None;
         self.is_video = false;
 
-        let read_result = fs::read(&path).map_err(|e| e.to_string());
-
-        let result = match read_result {
-            Ok(mut bytes) => {
-                match image::load_from_memory(&bytes) {
+        let result = if is_raw_file(&path) {
+            // Raw decoding can panic inside rawloader/imagepipe on malformed
+            // files; catch and report as error.
+            let p = path.clone();
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| decode_raw_image(&p))) {
+                Ok(r) => r,
+                Err(_) => Err("raw decoder panicked".to_string()),
+            }
+        } else if is_heif_file(&path) {
+            decode_heif_image(&path)
+        } else {
+            match fs::read(&path).map_err(|e| e.to_string()) {
+                Ok(mut bytes) => match image::load_from_memory(&bytes) {
                     Ok(img) => Ok(img),
                     Err(e) => {
                         if bytes.len() > 2 && bytes[0] == 0xFF && bytes[1] == 0xD8 {
@@ -420,9 +842,9 @@ impl PhotoViewer {
                             Err(e.to_string())
                         }
                     }
-                }
+                },
+                Err(e) => Err(e),
             }
-            Err(e) => Err(e),
         };
 
         match result {
@@ -628,6 +1050,17 @@ impl eframe::App for PhotoViewer {
             self.media_filter = self.media_filter.cycle();
         }
 
+        // R: toggle random vs ordered viewing
+        if ctx.input(|i| i.key_pressed(egui::Key::R)) {
+            self.view_order = self.view_order.toggle();
+        }
+
+        // 0: reset zoom + pan to defaults
+        if ctx.input(|i| i.key_pressed(egui::Key::Num0)) {
+            self.zoom = 1.0;
+            self.pan = egui::Vec2::ZERO;
+        }
+
         // Handle Zoom (Mouse Wheel + keyboard) - images and videos
         {
             let scroll = ctx.input(|i| i.raw_scroll_delta);
@@ -655,8 +1088,9 @@ impl eframe::App for PhotoViewer {
                 // Video rendering
                 if let Some(player) = &mut self.video_player {
                     let available = rect.size();
-                    // Reserve space for controls at bottom
-                    let controls_height = 40.0;
+                    // Reserve space for the floating controls panel at the
+                    // bottom so panning doesn't sit under them.
+                    let controls_height = 120.0;
                     let video_area = egui::vec2(available.x, available.y - controls_height);
 
                     // Click-to-pause and drag-to-pan on the video area (above controls)
@@ -716,125 +1150,364 @@ impl eframe::App for PhotoViewer {
                         Self::render_rotated_video(ui, texture_id, video_rect, self.video_rotation);
                     }
 
-                    // Controls bar at bottom
-                    let controls_rect = egui::Rect::from_min_size(
-                        egui::pos2(rect.min.x, rect.max.y - controls_height),
-                        egui::vec2(available.x, controls_height),
+                    // Floating controls panel: centered, rounded, not full
+                    // width. Two rows — a wide seek slider for precise
+                    // scrubbing on top, buttons/volume/fullscreen below.
+                    let panel_w = (available.x * 0.80).clamp(420.0, 1100.0);
+                    let panel_h = 88.0;
+                    let panel_bottom_margin = 0.0;
+                    let panel_rect = egui::Rect::from_min_size(
+                        egui::pos2(
+                            rect.min.x + (available.x - panel_w) / 2.0,
+                            rect.max.y - panel_h - panel_bottom_margin,
+                        ),
+                        egui::vec2(panel_w, panel_h),
                     );
 
-                    egui::Window::new("VideoControls")
-                        .fixed_rect(controls_rect)
-                        .title_bar(false)
-                        .resizable(false)
-                        .frame(egui::Frame::none().fill(egui::Color32::from_black_alpha(180)).inner_margin(4.0))
+                    egui::Area::new(egui::Id::new("VideoControls"))
+                        .fixed_pos(panel_rect.min)
+                        .order(egui::Order::Foreground)
                         .show(ctx, |ui| {
-                            ui.horizontal(|ui| {
-                                // Play/Pause button
-                                let state = player.player_state.get();
-                                let btn_text = match state {
-                                    PlayerState::Playing => "⏸",
-                                    _ => "▶",
-                                };
-                                if ui.button(btn_text).clicked() {
-                                    match state {
-                                        PlayerState::Playing => player.pause(),
-                                        PlayerState::Paused => player.resume(),
-                                        PlayerState::EndOfFile => {
-                                            player.seek(0.0);
-                                            player.resume();
+                            ui.set_width(panel_rect.width());
+                            ui.set_height(panel_rect.height());
+                            egui::Frame::none()
+                                .fill(egui::Color32::from_black_alpha(200))
+                                .rounding(14.0)
+                                .inner_margin(egui::Margin::symmetric(14.0, 10.0))
+                                .shadow(egui::epaint::Shadow {
+                                    offset: egui::vec2(0.0, 3.0),
+                                    blur: 12.0,
+                                    spread: 0.0,
+                                    color: egui::Color32::from_black_alpha(140),
+                                })
+                                .show(ui, |ui| {
+                                    ui.set_width(panel_rect.width() - 28.0);
+                            let elapsed = player.elapsed_ms();
+                            let duration = player.duration_ms;
+
+                            ui.vertical(|ui| {
+                                // ---- Row 1: custom-drawn seek bar ----
+                                let bar_height = 12.0;
+                                let (bar_rect, bar_response) = ui.allocate_exact_size(
+                                    egui::vec2(ui.available_width(), bar_height),
+                                    egui::Sense::click_and_drag(),
+                                );
+
+                                let pointer_frac = bar_response
+                                    .interact_pointer_pos()
+                                    .or_else(|| ui.input(|i| i.pointer.hover_pos()))
+                                    .map(|pos| {
+                                        ((pos.x - bar_rect.left()) / bar_rect.width())
+                                            .clamp(0.0, 1.0)
+                                    });
+
+                                // While dragging, buffer the target position and
+                                // commit it on release — calling player.seek() on
+                                // every drag frame causes noticeable lag.
+                                if bar_response.drag_started() {
+                                    if let Some(f) = pointer_frac {
+                                        self.scrubbing = Some(f);
+                                    }
+                                }
+                                if bar_response.dragged() {
+                                    if let Some(f) = pointer_frac {
+                                        self.scrubbing = Some(f);
+                                    }
+                                }
+                                if bar_response.drag_stopped() {
+                                    if let Some(f) = self.scrubbing.take() {
+                                        if duration > 0 {
+                                            player.seek(f);
                                         }
-                                        _ => player.start(),
+                                    }
+                                }
+                                if bar_response.clicked() && duration > 0 {
+                                    if let Some(f) = pointer_frac {
+                                        player.seek(f);
                                     }
                                 }
 
-                                // Current time
-                                let elapsed = player.elapsed_ms();
-                                let duration = player.duration_ms;
-                                ui.label(
-                                    egui::RichText::new(Self::format_time(elapsed))
-                                        .color(egui::Color32::WHITE)
-                                        .monospace(),
-                                );
-
-                                // Seek bar
-                                let mut seek_pos = if duration > 0 {
-                                    elapsed as f32 / duration as f32
+                                let played_frac = if duration > 0 {
+                                    (elapsed as f32 / duration as f32).clamp(0.0, 1.0)
                                 } else {
                                     0.0
                                 };
-                                let slider = egui::Slider::new(&mut seek_pos, 0.0..=1.0)
-                                    .show_value(false)
-                                    .trailing_fill(true);
-                                let response = ui.add_sized(
-                                    [ui.available_width() - 160.0, 20.0],
-                                    slider,
-                                );
-                                if response.changed() {
-                                    player.seek(seek_pos);
-                                }
-                                // Hover tooltip: show time at cursor position
-                                if response.hovered() {
-                                    if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
-                                        let frac = ((pos.x - response.rect.left()) / response.rect.width()).clamp(0.0, 1.0);
-                                        let hover_ms = (frac * duration as f32) as i64;
-                                        response.on_hover_text(Self::format_time(hover_ms));
-                                    }
-                                }
+                                let display_frac = self.scrubbing.unwrap_or(played_frac);
 
-                                // Total time
-                                ui.label(
-                                    egui::RichText::new(Self::format_time(duration))
-                                        .color(egui::Color32::WHITE)
-                                        .monospace(),
+                                let painter = ui.painter();
+                                let rounding = egui::Rounding::same(bar_height * 0.5);
+                                painter.rect_filled(
+                                    bar_rect,
+                                    rounding,
+                                    egui::Color32::from_rgb(55, 55, 60),
                                 );
-
-                                // Loop toggle
-                                let loop_text = if player.options.looping { "🔁" } else { "🔁" };
-                                let loop_btn = ui.button(
-                                    egui::RichText::new(loop_text).color(
-                                        if player.options.looping {
-                                            egui::Color32::from_rgb(100, 200, 255)
-                                        } else {
-                                            egui::Color32::GRAY
-                                        }
-                                    )
-                                );
-                                if loop_btn.on_hover_text("Toggle loop").clicked() {
-                                    self.video_looping = !self.video_looping;
-                                    player.options.looping = self.video_looping;
-                                }
-
-                                // Volume control or no-audio indicator
-                                if self.video_has_audio {
-                                    let vol_icon = if self.video_volume == 0.0 { "🔇" } else { "🔊" };
-                                    ui.label(egui::RichText::new(vol_icon).color(egui::Color32::WHITE));
-                                    let vol_slider = egui::Slider::new(&mut self.video_volume, 0.0..=1.0)
-                                        .show_value(false)
-                                        .trailing_fill(true);
-                                    let vol_response = ui.add_sized([100.0, 20.0], vol_slider);
-                                    if vol_response.changed() {
-                                        player.options.audio_volume.set(self.video_volume);
-                                    }
-                                    vol_response.on_hover_text(format!("{}%", (self.video_volume * 100.0).round() as i32));
-                                } else {
-                                    ui.label(
-                                        egui::RichText::new("🔇 No Audio")
-                                            .color(egui::Color32::from_rgb(180, 180, 180)),
+                                if display_frac > 0.0 {
+                                    let mut filled = bar_rect;
+                                    filled.max.x =
+                                        filled.min.x + bar_rect.width() * display_frac;
+                                    painter.rect_filled(
+                                        filled,
+                                        rounding,
+                                        egui::Color32::from_rgb(100, 200, 255),
                                     );
                                 }
+                                let handle_x =
+                                    bar_rect.left() + bar_rect.width() * display_frac;
+                                painter.circle_filled(
+                                    egui::pos2(handle_x, bar_rect.center().y),
+                                    bar_height * 0.8,
+                                    egui::Color32::WHITE,
+                                );
 
-                                // Fullscreen toggle
-                                let is_fullscreen = ctx.input(|i| {
-                                    i.viewport().fullscreen.unwrap_or(false)
-                                });
-                                let fs_icon = if is_fullscreen { "⊡" } else { "⊞" };
-                                if ui.button(egui::RichText::new(fs_icon).color(egui::Color32::WHITE))
-                                    .on_hover_text("Toggle fullscreen (F11)")
-                                    .clicked()
-                                {
-                                    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!is_fullscreen));
+                                // ---- Preview thumbnail (YouTube-style) ----
+                                let show_preview = (bar_response.hovered()
+                                    || bar_response.dragged())
+                                    && duration > 0;
+                                if show_preview {
+                                    if let Some(frac) = pointer_frac {
+                                        // Lazily upload any newly-decoded
+                                        // thumbnails into GPU textures.
+                                        {
+                                            let thumbs = self.seek_thumbs.lock().unwrap();
+                                            for (i, slot) in thumbs.iter().enumerate() {
+                                                if let Some(img) = slot {
+                                                    if self
+                                                        .seek_thumb_textures
+                                                        .get(i)
+                                                        .and_then(|t| t.as_ref())
+                                                        .is_none()
+                                                    {
+                                                        let handle = ctx.load_texture(
+                                                            format!("seek_thumb_{}", i),
+                                                            img.clone(),
+                                                            egui::TextureOptions::LINEAR,
+                                                        );
+                                                        if i < self.seek_thumb_textures.len() {
+                                                            self.seek_thumb_textures[i] =
+                                                                Some(handle);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        let count = self.seek_thumb_textures.len().max(1);
+                                        let idx = ((frac * count as f32) as usize)
+                                            .min(count - 1);
+                                        // Find the nearest available thumb
+                                        // (search outward from idx).
+                                        let mut found: Option<&egui::TextureHandle> = None;
+                                        for step in 0..count {
+                                            let candidates = [
+                                                idx.saturating_sub(step),
+                                                (idx + step).min(count - 1),
+                                            ];
+                                            for c in candidates {
+                                                if let Some(Some(tex)) =
+                                                    self.seek_thumb_textures.get(c)
+                                                {
+                                                    found = Some(tex);
+                                                    break;
+                                                }
+                                            }
+                                            if found.is_some() {
+                                                break;
+                                            }
+                                        }
+
+                                        if let Some(tex) = found {
+                                            let tex_size = tex.size_vec2();
+                                            let preview_w = 192.0_f32;
+                                            let preview_h = if tex_size.x > 0.0 {
+                                                preview_w * tex_size.y / tex_size.x
+                                            } else {
+                                                108.0
+                                            };
+                                            let caption_h = 18.0;
+                                            let total_h = preview_h + caption_h;
+                                            let padding = 4.0;
+
+                                            let cursor_x = bar_rect.left()
+                                                + bar_rect.width() * frac;
+                                            let preview_bottom = bar_rect.top() - 10.0;
+                                            let mut preview_left = cursor_x - preview_w / 2.0;
+                                            // Clamp within the panel so it doesn't
+                                            // slip off either edge.
+                                            let clamp_left = panel_rect.left() + 6.0;
+                                            let clamp_right = panel_rect.right() - 6.0;
+                                            if preview_left < clamp_left {
+                                                preview_left = clamp_left;
+                                            }
+                                            if preview_left + preview_w > clamp_right {
+                                                preview_left = clamp_right - preview_w;
+                                            }
+                                            let preview_rect = egui::Rect::from_min_size(
+                                                egui::pos2(
+                                                    preview_left,
+                                                    preview_bottom - total_h,
+                                                ),
+                                                egui::vec2(preview_w, total_h),
+                                            );
+
+                                            // Draw on a top-layer painter so
+                                            // the preview sits above the panel.
+                                            let layer = egui::LayerId::new(
+                                                egui::Order::Foreground,
+                                                egui::Id::new("seek_preview"),
+                                            );
+                                            let top = ctx.layer_painter(layer);
+                                            let bg_rect = preview_rect.expand(padding);
+                                            top.rect_filled(
+                                                bg_rect,
+                                                egui::Rounding::same(6.0),
+                                                egui::Color32::from_black_alpha(220),
+                                            );
+                                            let img_rect = egui::Rect::from_min_size(
+                                                preview_rect.min,
+                                                egui::vec2(preview_w, preview_h),
+                                            );
+                                            top.image(
+                                                tex.id(),
+                                                img_rect,
+                                                egui::Rect::from_min_max(
+                                                    egui::pos2(0.0, 0.0),
+                                                    egui::pos2(1.0, 1.0),
+                                                ),
+                                                egui::Color32::WHITE,
+                                            );
+                                            let hover_ms = (frac * duration as f32) as i64;
+                                            top.text(
+                                                egui::pos2(
+                                                    preview_rect.center().x,
+                                                    preview_rect.min.y + preview_h + 2.0,
+                                                ),
+                                                egui::Align2::CENTER_TOP,
+                                                Self::format_time(hover_ms),
+                                                egui::FontId::monospace(12.0),
+                                                egui::Color32::WHITE,
+                                            );
+                                        } else {
+                                            // Thumbs not ready yet — at least
+                                            // show a time tooltip.
+                                            let hover_ms = (frac * duration as f32) as i64;
+                                            bar_response.clone().on_hover_text(
+                                                Self::format_time(hover_ms),
+                                            );
+                                        }
+                                    }
                                 }
+
+                                ui.add_space(6.0);
+
+                                // ---- Row 2: buttons + time + volume + fullscreen ----
+                                ui.horizontal(|ui| {
+                                    let state = player.player_state.get();
+                                    let btn_text = match state {
+                                        PlayerState::Playing => "⏸",
+                                        _ => "▶",
+                                    };
+                                    if ui.button(egui::RichText::new(btn_text).size(16.0)).clicked() {
+                                        match state {
+                                            PlayerState::Playing => player.pause(),
+                                            PlayerState::Paused => player.resume(),
+                                            PlayerState::EndOfFile => {
+                                                player.seek(0.0);
+                                                player.resume();
+                                            }
+                                            _ => player.start(),
+                                        }
+                                    }
+
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{} / {}",
+                                            Self::format_time(elapsed),
+                                            Self::format_time(duration),
+                                        ))
+                                        .color(egui::Color32::WHITE)
+                                        .monospace(),
+                                    );
+
+                                    // Loop toggle
+                                    let loop_btn = ui.button(
+                                        egui::RichText::new("🔁").color(
+                                            if player.options.looping {
+                                                egui::Color32::from_rgb(100, 200, 255)
+                                            } else {
+                                                egui::Color32::GRAY
+                                            },
+                                        ),
+                                    );
+                                    if loop_btn.on_hover_text("Toggle loop").clicked() {
+                                        self.video_looping = !self.video_looping;
+                                        player.options.looping = self.video_looping;
+                                    }
+
+                                    // Right-side cluster: fullscreen on the far right,
+                                    // volume immediately left of it. `with_layout`
+                                    // lays children out right-to-left so the items
+                                    // read left-to-right in the final result.
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            let is_fullscreen = ctx.input(|i| {
+                                                i.viewport().fullscreen.unwrap_or(false)
+                                            });
+                                            let fs_icon = if is_fullscreen { "⊡" } else { "⊞" };
+                                            if ui
+                                                .button(
+                                                    egui::RichText::new(fs_icon)
+                                                        .color(egui::Color32::WHITE),
+                                                )
+                                                .on_hover_text("Toggle fullscreen (F11)")
+                                                .clicked()
+                                            {
+                                                ctx.send_viewport_cmd(
+                                                    egui::ViewportCommand::Fullscreen(!is_fullscreen),
+                                                );
+                                            }
+
+                                            if self.video_has_audio {
+                                                let vol_slider = egui::Slider::new(
+                                                    &mut self.video_volume,
+                                                    0.0..=1.0,
+                                                )
+                                                .show_value(false)
+                                                .trailing_fill(true);
+                                                let vol_response =
+                                                    ui.add_sized([110.0, 20.0], vol_slider);
+                                                if vol_response.changed() {
+                                                    player
+                                                        .options
+                                                        .audio_volume
+                                                        .set(self.video_volume);
+                                                }
+                                                vol_response.on_hover_text(format!(
+                                                    "{}%",
+                                                    (self.video_volume * 100.0).round() as i32
+                                                ));
+
+                                                let vol_icon = if self.video_volume == 0.0 {
+                                                    "🔇"
+                                                } else {
+                                                    "🔊"
+                                                };
+                                                ui.label(
+                                                    egui::RichText::new(vol_icon)
+                                                        .color(egui::Color32::WHITE),
+                                                );
+                                            } else {
+                                                ui.label(
+                                                    egui::RichText::new("🔇 No Audio").color(
+                                                        egui::Color32::from_rgb(180, 180, 180),
+                                                    ),
+                                                );
+                                            }
+                                        },
+                                    );
+                                });
                             });
+                                });
                         });
 
                     // Request continuous repaint for video playback
@@ -881,8 +1554,8 @@ impl eframe::App for PhotoViewer {
                                  Images: Space / Right Arrow = Next  |  Left Arrow = Prev  |  +/- Zoom\n\
                                  Videos: Left/Right Arrow = Seek 3s  |  Ctrl + Left/Right = Prev/Next\n\
                                  Space: Play/Pause (video)  |  Next (image)\n\
-                                 Scroll to Zoom  |  Drag to Pan\n\
-                                 F11: Fullscreen  |  M: Filter (All / Images / Videos)\n\
+                                 Scroll to Zoom  |  Drag to Pan  |  0: Reset View\n\
+                                 F11: Fullscreen  |  M: Filter  |  R: Random / Ordered\n\
                                  Double-tap Esc: Close",
                             )
                             .color(egui::Color32::WHITE)
@@ -937,6 +1610,10 @@ impl eframe::App for PhotoViewer {
                                 format!("Filter: {}", self.media_filter.label()),
                             );
                         }
+                        ui.colored_label(
+                            egui::Color32::from_rgb(100, 200, 255),
+                            format!("Order: {}", self.view_order.label()),
+                        );
                         if let Some(err) = &self.error_msg {
                             ui.colored_label(egui::Color32::RED, err);
                         }
