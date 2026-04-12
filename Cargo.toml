@@ -9,9 +9,20 @@ repository = "https://github.com/davidgiang1/fast-photo-viewer"
 version = "0.1"
 
 [dependencies]
-eframe = "0.29"
+eframe = { version = "0.29", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "wayland",
+    "web_screen_reader",
+    "x11",
+    "wgpu",
+] }
+# wgpu backends: eframe's "wgpu" feature only pulls in wgpu with metal+webgpu
+# enabled, so we add the native Windows backend here. Feature unification
+# means eframe still gets its own features.
+wgpu = { version = "22", features = ["dx12"] }
+egui-wgpu = "0.29"
 egui_extras = { version = "0.29", features = ["all_loaders"] }
-egui-video = "0.9"
 image = { version = "0.25" }
 walkdir = "2"
 rand = "0.8"
@@ -19,6 +30,8 @@ rfd = "0.15"
 ffmpeg-the-third = "2.0"
 rawloader = "0.37"
 imagepipe = "0.5"
+cpal = "0.15"
+ringbuf = "0.4"
 
 # Patched locally: upstream 2.0.1 panics in
 # software::resampling::context::Context::get_with2 when the source audio

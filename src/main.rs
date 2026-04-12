@@ -1,5 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod video_player;
+
 use eframe::egui;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -10,7 +12,7 @@ use std::collections::HashSet;
 use walkdir::WalkDir;
 use rand::seq::SliceRandom;
 use image::DynamicImage;
-use egui_video::{AudioDevice, Player, PlayerState};
+use crate::video_player::{Player, PlayerState};
 use ffmpeg_the_third as ffmpeg;
 
 const IMAGE_EXTENSIONS: &[&str] = &[
@@ -119,13 +121,8 @@ fn matches_filter(path: &Path, filter: MediaFilter) -> bool {
     }
 }
 
-/// Check if a video file actually contains an audio stream using ffmpeg.
-fn file_has_audio_stream(path: &Path) -> bool {
-    match ffmpeg::format::input(&path) {
-        Ok(ctx) => ctx.streams().any(|s| s.parameters().medium() == ffmpeg::media::Type::Audio),
-        Err(_) => true, // Assume audio if probe fails
-    }
-}
+// `file_has_audio_stream` was used by the old egui-video path; the in-
+// house player now owns audio probing internally.
 
 /// Scan a byte slice for the largest embedded JPEG (SOI..EOI). Works
 /// because within a valid JPEG payload, any `0xFF` byte is followed by
@@ -414,6 +411,10 @@ fn main() -> eframe::Result<()> {
             .with_inner_size([800.0, 600.0])
             .with_title("Fast Photo Viewer")
             .with_icon(std::sync::Arc::new(icon)),
+        // Request the wgpu renderer so we can obtain a wgpu::Device in
+        // CreationContext and manage our own video textures / custom
+        // render callbacks downstream.
+        renderer: eframe::Renderer::Wgpu,
         ..Default::default()
     };
 
@@ -434,7 +435,6 @@ struct PhotoViewer {
 
     // Video
     video_player: Option<Player>,
-    audio_device: AudioDevice,
     is_video: bool,
     video_looping: bool,
     video_volume: f32,
@@ -473,17 +473,23 @@ struct PhotoViewer {
     texture: Option<egui::TextureHandle>,
     error_msg: Option<String>,
     pending_initial_file: Option<PathBuf>,
+    wgpu_backend: Option<video_player::WgpuBackend>,
 }
 
 impl PhotoViewer {
-    fn new(_cc: &eframe::CreationContext<'_>, initial_file: Option<PathBuf>) -> Self {
-        let audio_device = AudioDevice::new().expect("Failed to initialize audio device");
+    fn new(cc: &eframe::CreationContext<'_>, initial_file: Option<PathBuf>) -> Self {
+        let wgpu_backend = cc.wgpu_render_state.as_ref().map(|rs| {
+            video_player::WgpuBackend {
+                device: rs.device.clone(),
+                queue: rs.queue.clone(),
+                renderer: rs.renderer.clone(),
+            }
+        });
         Self {
             media_paths: Arc::new(Mutex::new(Vec::new())),
             current_media_path: None,
             current_image: None,
             video_player: None,
-            audio_device,
             is_video: false,
             video_looping: true,
             video_volume: 0.10,
@@ -500,6 +506,7 @@ impl PhotoViewer {
             pan: egui::Vec2::ZERO,
             media_filter: MediaFilter::All,
             view_order: ViewOrder::Random,
+            wgpu_backend,
             is_scanning: Arc::new(Mutex::new(false)),
             scan_count: Arc::new(Mutex::new(0)),
             texture: None,
@@ -748,59 +755,19 @@ impl PhotoViewer {
             });
         }
 
-        // Probe file for audio streams before opening player
-        self.video_has_audio = file_has_audio_stream(&path);
-
-        let path_str = path.to_string_lossy().to_string();
-        let initial_player = match Player::new(ctx, &path_str) {
-            Ok(p) => p,
+        match Player::open_with_backend(ctx, &path, self.wgpu_backend.clone()) {
+            Ok(mut player) => {
+                player.set_looping(self.video_looping);
+                player.set_volume(self.video_volume);
+                player.play();
+                self.video_has_audio = player.has_audio();
+                self.video_player = Some(player);
+                self.is_video = true;
+                self.seek_frac = 0.0;
+                self.error_msg = None;
+            }
             Err(e) => {
                 let msg = format!("Error loading video {}: {}", path.display(), e);
-                println!("{}", msg);
-                self.error_msg = Some(msg);
-                self.video_player = None;
-                self.is_video = false;
-                return;
-            }
-        };
-
-        // `with_audio` can panic inside ffmpeg-the-third when building a
-        // resampler for unusual channel layouts (e.g. some iPhone MOV files),
-        // so catch unwinds and fall back to silent playback.
-        let audio_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            initial_player.with_audio(&mut self.audio_device)
-        }));
-
-        let audio_err: String = match audio_result {
-            Ok(Ok(mut player)) => {
-                player.options.looping = self.video_looping;
-                if self.video_has_audio {
-                    player.options.audio_volume.set(self.video_volume);
-                }
-                player.start();
-                self.video_player = Some(player);
-                self.is_video = true;
-                self.seek_frac = 0.0;
-                self.error_msg = None;
-                return;
-            }
-            Ok(Err(e)) => e.to_string(),
-            Err(_) => "ffmpeg panicked during audio init (unsupported channel layout)".to_string(),
-        };
-
-        println!("Audio init failed ({}), playing without audio", audio_err);
-        match Player::new(ctx, &path_str) {
-            Ok(mut player) => {
-                player.options.looping = self.video_looping;
-                player.start();
-                self.video_player = Some(player);
-                self.is_video = true;
-                self.video_has_audio = false;
-                self.seek_frac = 0.0;
-                self.error_msg = None;
-            }
-            Err(e) => {
-                let msg = format!("Error loading video {} (no-audio fallback): {}", path.display(), e);
                 println!("{}", msg);
                 self.error_msg = Some(msg);
                 self.video_player = None;
@@ -944,9 +911,9 @@ impl eframe::App for PhotoViewer {
             }
         }
 
-        // Process video state
+        // Upload any new decoded video frames.
         if let Some(player) = &mut self.video_player {
-            player.process_state();
+            player.tick();
         }
 
         // Handle input differently for video vs image mode
@@ -965,9 +932,10 @@ impl eframe::App for PhotoViewer {
                 // Seek ±3 seconds
                 if ctx.input(|i| i.key_pressed(egui::Key::ArrowRight)) {
                     if let Some(player) = &mut self.video_player {
-                        if player.duration_ms > 0 {
-                            let step = 3000.0 / player.duration_ms as f32;
-                            let current = player.elapsed_ms() as f32 / player.duration_ms as f32;
+                        let duration = player.duration_ms();
+                        if duration > 0 {
+                            let step = 3000.0 / duration as f32;
+                            let current = player.elapsed_ms() as f32 / duration as f32;
                             let target = (current + step).clamp(0.0, 1.0);
                             player.seek(target);
                         }
@@ -975,9 +943,10 @@ impl eframe::App for PhotoViewer {
                 }
                 if ctx.input(|i| i.key_pressed(egui::Key::ArrowLeft)) {
                     if let Some(player) = &mut self.video_player {
-                        if player.duration_ms > 0 {
-                            let step = 3000.0 / player.duration_ms as f32;
-                            let current = player.elapsed_ms() as f32 / player.duration_ms as f32;
+                        let duration = player.duration_ms();
+                        if duration > 0 {
+                            let step = 3000.0 / duration as f32;
+                            let current = player.elapsed_ms() as f32 / duration as f32;
                             let target = (current - step).clamp(0.0, 1.0);
                             player.seek(target);
                         }
@@ -988,24 +957,24 @@ impl eframe::App for PhotoViewer {
             if ctx.input(|i| i.key_pressed(egui::Key::ArrowUp)) {
                 self.video_volume = (self.video_volume + 0.02).clamp(0.0, 1.0);
                 if let Some(player) = &mut self.video_player {
-                    player.options.audio_volume.set(self.video_volume);
+                    player.set_volume(self.video_volume);
                 }
             }
             if ctx.input(|i| i.key_pressed(egui::Key::ArrowDown)) {
                 self.video_volume = (self.video_volume - 0.02).clamp(0.0, 1.0);
                 if let Some(player) = &mut self.video_player {
-                    player.options.audio_volume.set(self.video_volume);
+                    player.set_volume(self.video_volume);
                 }
             }
             if ctx.input(|i| i.key_pressed(egui::Key::Space)) {
                 // Space toggles play/pause for video
                 if let Some(player) = &mut self.video_player {
-                    match player.player_state.get() {
+                    match player.state() {
                         PlayerState::Playing => player.pause(),
-                        PlayerState::Paused => player.resume(),
+                        PlayerState::Paused => player.play(),
                         PlayerState::EndOfFile => {
                             player.seek(0.0);
-                            player.resume();
+                            player.play();
                         }
                         _ => {}
                     }
@@ -1100,12 +1069,12 @@ impl eframe::App for PhotoViewer {
                         self.pan += video_interact.drag_delta();
                     }
                     if video_interact.clicked() {
-                        match player.player_state.get() {
+                        match player.state() {
                             PlayerState::Playing => player.pause(),
-                            PlayerState::Paused => player.resume(),
+                            PlayerState::Paused => player.play(),
                             PlayerState::EndOfFile => {
                                 player.seek(0.0);
-                                player.resume();
+                                player.play();
                             }
                             _ => {}
                         }
@@ -1113,7 +1082,8 @@ impl eframe::App for PhotoViewer {
 
                     // Scale video to fit while maintaining aspect ratio
                     // For 90/270 rotation, swap the video dimensions for aspect ratio calc
-                    let video_size = player.size;
+                    let (src_w, src_h) = player.size();
+                    let video_size = egui::vec2(src_w as f32, src_h as f32);
                     let (effective_w, effective_h) = if self.video_rotation == 90 || self.video_rotation == 270 {
                         (video_size.y, video_size.x)
                     } else {
@@ -1138,16 +1108,17 @@ impl eframe::App for PhotoViewer {
 
                     // Render via painter directly (not render_frame_at) so our
                     // click interaction isn't consumed by an internal widget.
-                    let texture_id = player.texture_handle.id();
-                    if self.video_rotation == 0 {
-                        ui.painter().image(
-                            texture_id,
-                            video_rect,
-                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                            egui::Color32::WHITE,
-                        );
-                    } else {
-                        Self::render_rotated_video(ui, texture_id, video_rect, self.video_rotation);
+                    if let Some(texture_id) = player.texture_id() {
+                        if self.video_rotation == 0 {
+                            ui.painter().image(
+                                texture_id,
+                                video_rect,
+                                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                egui::Color32::WHITE,
+                            );
+                        } else {
+                            Self::render_rotated_video(ui, texture_id, video_rect, self.video_rotation);
+                        }
                     }
 
                     // Floating controls panel: centered, rounded, not full
@@ -1183,7 +1154,7 @@ impl eframe::App for PhotoViewer {
                                 .show(ui, |ui| {
                                     ui.set_width(panel_rect.width() - 28.0);
                             let elapsed = player.elapsed_ms();
-                            let duration = player.duration_ms;
+                            let duration = player.duration_ms();
 
                             ui.vertical(|ui| {
                                 // ---- Row 1: custom-drawn seek bar ----
@@ -1401,7 +1372,7 @@ impl eframe::App for PhotoViewer {
 
                                 // ---- Row 2: buttons + time + volume + fullscreen ----
                                 ui.horizontal(|ui| {
-                                    let state = player.player_state.get();
+                                    let state = player.state();
                                     let btn_text = match state {
                                         PlayerState::Playing => "⏸",
                                         _ => "▶",
@@ -1409,12 +1380,12 @@ impl eframe::App for PhotoViewer {
                                     if ui.button(egui::RichText::new(btn_text).size(16.0)).clicked() {
                                         match state {
                                             PlayerState::Playing => player.pause(),
-                                            PlayerState::Paused => player.resume(),
+                                            PlayerState::Paused => player.play(),
                                             PlayerState::EndOfFile => {
                                                 player.seek(0.0);
-                                                player.resume();
+                                                player.play();
                                             }
-                                            _ => player.start(),
+                                            _ => player.play(),
                                         }
                                     }
 
@@ -1431,7 +1402,7 @@ impl eframe::App for PhotoViewer {
                                     // Loop toggle
                                     let loop_btn = ui.button(
                                         egui::RichText::new("🔁").color(
-                                            if player.options.looping {
+                                            if self.video_looping {
                                                 egui::Color32::from_rgb(100, 200, 255)
                                             } else {
                                                 egui::Color32::GRAY
@@ -1440,7 +1411,7 @@ impl eframe::App for PhotoViewer {
                                     );
                                     if loop_btn.on_hover_text("Toggle loop").clicked() {
                                         self.video_looping = !self.video_looping;
-                                        player.options.looping = self.video_looping;
+                                        player.set_looping(self.video_looping);
                                     }
 
                                     // Right-side cluster: fullscreen on the far right,
@@ -1477,10 +1448,7 @@ impl eframe::App for PhotoViewer {
                                                 let vol_response =
                                                     ui.add_sized([110.0, 20.0], vol_slider);
                                                 if vol_response.changed() {
-                                                    player
-                                                        .options
-                                                        .audio_volume
-                                                        .set(self.video_volume);
+                                                    player.set_volume(self.video_volume);
                                                 }
                                                 vol_response.on_hover_text(format!(
                                                     "{}%",
