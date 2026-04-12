@@ -1,5 +1,6 @@
 /target
 /.claude
+/.cargo
 /ffmpeg-dev
 /ffmpeg-btbn
 /ffmpeg7

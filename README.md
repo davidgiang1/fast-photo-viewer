@@ -70,10 +70,18 @@ Or launch the application and use the keyboard shortcuts:
 
 ## Building from Source
 
-1. Install [Rust](https://rustup.rs/)
-2. Download [FFmpeg shared libraries](https://github.com/BtbN/FFmpeg-Builds/releases) (win64-gpl-shared) and set `FFMPEG_DIR` to the extracted folder
-3. Build:
+Requires **FFmpeg 7.x** specifically (matches `ffmpeg-the-third 2.0`). FFmpeg 8.x will fail to build.
+
+1. Install [Rust](https://rustup.rs/) and [LLVM](https://github.com/llvm/llvm-project/releases) (LLVM provides `libclang`, needed by `bindgen`).
+2. Download FFmpeg 7.x **shared** libraries (e.g. an `n7.1` release from [BtbN](https://github.com/BtbN/FFmpeg-Builds/releases) or [gyan.dev](https://www.gyan.dev/ffmpeg/builds/)) and extract into the project root, e.g. `./ffmpeg7/ffmpeg-n7.1-latest-win64-gpl-shared-7.1/`.
+3. Create `.cargo/config.toml` so Cargo can find it:
+    ```toml
+    [env]
+    FFMPEG_DIR = { value = "ffmpeg7/ffmpeg-n7.1-latest-win64-gpl-shared-7.1", relative = true }
+    ```
+   `relative = true` resolves the path against the project root. Adjust the path to match where you extracted FFmpeg, or use an absolute path with `relative = false`.
+4. Build:
     ```bash
     cargo build --release
     ```
-4. The binary will be at `target/release/fast-photo-viewer.exe` (copy FFmpeg DLLs alongside it)
+5. The binary will be at `target/release/fast-photo-viewer.exe`. Copy the FFmpeg DLLs from `<FFMPEG_DIR>/bin/` alongside it.
