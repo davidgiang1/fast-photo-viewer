@@ -427,10 +427,19 @@ fn main() -> eframe::Result<()> {
                 } else {
                     eframe::wgpu::Features::empty()
                 };
+                // `Limits::default()` caps `max_texture_dimension_2d`
+                // at 8192. Modern 45+MP cameras exceed that (Nikon
+                // Z8/Z9 8256×5504, Sony A7R V 9504×6336, Fujifilm
+                // GFX100 11648×8736), so uploading their full-res
+                // frames blew up wgpu validation and crashed the app.
+                // Raise the resolution limits to whatever the adapter
+                // actually supports (typically 16384 on desktop).
+                let required_limits = eframe::wgpu::Limits::default()
+                    .using_resolution(adapter.limits());
                 eframe::wgpu::DeviceDescriptor {
                     label: Some("fast-photo-viewer"),
                     required_features,
-                    required_limits: eframe::wgpu::Limits::default(),
+                    required_limits,
                     memory_hints: eframe::wgpu::MemoryHints::default(),
                 }
             }),
@@ -863,9 +872,25 @@ impl PhotoViewer {
 
     fn regenerate_texture(&mut self, ctx: &egui::Context) {
         if let Some(image) = &self.current_image {
-            let size = [image.width() as usize, image.height() as usize];
-            let image_buffer = image.to_rgba8();
-            let pixels = image_buffer.as_flat_samples();
+            // Clamp to the backend's max texture side so an oversized
+            // image (e.g. 60+MP panorama on a GPU with a 16384 cap)
+            // degrades to a scaled-down view instead of crashing wgpu
+            // validation when the ColorImage is uploaded.
+            let max_side = ctx.input(|i| i.max_texture_side).max(1);
+            let (w, h) = (image.width() as usize, image.height() as usize);
+            let over = w.max(h);
+            let rgba = if over > max_side {
+                let scale = max_side as f32 / over as f32;
+                let new_w = ((w as f32 * scale).floor() as u32).max(1);
+                let new_h = ((h as f32 * scale).floor() as u32).max(1);
+                image
+                    .resize(new_w, new_h, image::imageops::FilterType::Triangle)
+                    .to_rgba8()
+            } else {
+                image.to_rgba8()
+            };
+            let size = [rgba.width() as usize, rgba.height() as usize];
+            let pixels = rgba.as_flat_samples();
 
             let color_image = egui::ColorImage::from_rgba_unmultiplied(
                 size,
