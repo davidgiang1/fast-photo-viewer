@@ -29,9 +29,9 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use eframe::egui;
 use ffmpeg_the_third as ffmpeg;
 use ffmpeg::ffi::{
-    av_buffer_ref, av_buffer_unref, av_hwdevice_ctx_create, av_hwframe_transfer_data,
-    av_seek_frame, avformat_flush, avio_seek, AVBufferRef, AVCodecContext, AVHWDeviceType,
-    AVPixelFormat, AVSEEK_FLAG_ANY, AVSEEK_FLAG_BACKWARD,
+    av_buffer_ref, av_buffer_unref, av_frame_unref, av_hwdevice_ctx_create,
+    av_hwframe_transfer_data, av_seek_frame, avformat_flush, avio_seek, AVBufferRef,
+    AVCodecContext, AVHWDeviceType, AVPixelFormat, AVSEEK_FLAG_ANY, AVSEEK_FLAG_BACKWARD,
 };
 use ringbuf::{
     traits::{Consumer, Producer, Split},
@@ -93,7 +93,13 @@ enum Command {
 /// — the receiving thread should flush its decoder and discard any
 /// queued output.
 enum DecodeMsg {
-    Packet(ffmpeg::Packet),
+    /// Encoded packet, tagged with the demuxer's `flush_seq` at the
+    /// moment it was routed. Workers compare the tag against the
+    /// current `Shared::flush_seq` and discard messages whose tag
+    /// is stale — this lets a mid-seek worker skip decoding the
+    /// entire backlog of pre-seek packets almost instantly instead
+    /// of paying one full decode per stale packet.
+    Packet(ffmpeg::Packet, u64),
     Flush,
 }
 
@@ -103,6 +109,10 @@ struct SharedState {
     width: u32,
     height: u32,
     has_audio: bool,
+    /// Average frame interval in microseconds, computed from the
+    /// video stream's reported frame rate. Used by the GUI for
+    /// frame-step keybinds (comma / period) and as a pacing hint.
+    frame_interval_us: i64,
     error: Option<String>,
 }
 
@@ -118,6 +128,40 @@ struct Shared {
     /// Set to true briefly after a seek so the audio callback can decide
     /// not to advance the clock past what's been flushed.
     clock_frozen: std::sync::atomic::AtomicBool,
+    /// Signals the cpal callback to discard everything currently in
+    /// the audio ring buffer and start fresh. Set by the demuxer on
+    /// seek or loop-wraparound so stale buffered audio stops
+    /// immediately instead of continuing until the ring drains.
+    audio_drain_flag: std::sync::atomic::AtomicBool,
+    /// Raised by the demuxer on seek and cleared by the video worker
+    /// when it processes the subsequent `DecodeMsg::Flush`. While
+    /// raised, the worker drops any frames it decodes instead of
+    /// pushing them into the shared queue — this prevents frames
+    /// that were buffered in the ffmpeg decoder from before the seek
+    /// from flickering through as "fast-forward" before the new
+    /// position takes effect.
+    flush_pending: std::sync::atomic::AtomicBool,
+    /// Minimum pts (microseconds) that the video worker is allowed
+    /// to push into the display queue. Set by the demuxer to the
+    /// seek target so the codec's pre-target warmup frames (from the
+    /// keyframe backward-seek) get decoded but not displayed.
+    min_display_pts_us: AtomicI64,
+    /// Incremented every time the video worker successfully pushes a
+    /// post-seek frame (i.e., a frame that passed the
+    /// `min_display_pts_us` gate). The demuxer uses this to know
+    /// when it can stop priming packets after a seek and return to
+    /// its normal paused state.
+    post_seek_frames_pushed: std::sync::atomic::AtomicU32,
+    /// Set on Player drop. Worker threads check this in their
+    /// back-pressure wait so `decode_thread.join()` can return
+    /// even when the shared video queue is full.
+    stopping: std::sync::atomic::AtomicBool,
+    /// Monotonic flush counter. The demuxer increments this when it
+    /// initiates a seek; the workers compare it against the last
+    /// value they saw and, on mismatch, call `decoder.flush()` plus
+    /// clear the display queue. Replaces the in-channel `Flush`
+    /// message so seek handling never blocks on a full channel.
+    flush_seq: std::sync::atomic::AtomicU64,
 }
 
 /// Render backend passed to `Player::open`. When `Wgpu` is supplied,
@@ -141,6 +185,7 @@ pub struct WgpuBackend {
 pub struct Player {
     shared: Arc<Shared>,
     cmd_tx: Sender<Command>,
+    decode_thread: Option<thread::JoinHandle<()>>,
     _audio_stream: Option<cpal::Stream>,
     // Egui-managed fallback path (test binary uses this).
     texture: Option<egui::TextureHandle>,
@@ -201,12 +246,19 @@ impl Player {
                 width: 0,
                 height: 0,
                 has_audio: false,
+                frame_interval_us: 33_333,
                 error: None,
             }),
             video_queue: Mutex::new(VecDeque::new()),
             audio_clock_us: AtomicI64::new(0),
             volume_bits: AtomicU32::new(1.0f32.to_bits()),
             clock_frozen: std::sync::atomic::AtomicBool::new(false),
+            audio_drain_flag: std::sync::atomic::AtomicBool::new(false),
+            flush_pending: std::sync::atomic::AtomicBool::new(false),
+            min_display_pts_us: AtomicI64::new(i64::MIN),
+            post_seek_frames_pushed: std::sync::atomic::AtomicU32::new(0),
+            stopping: std::sync::atomic::AtomicBool::new(false),
+            flush_seq: std::sync::atomic::AtomicU64::new(0),
         });
 
         // Audio ring buffer: 4 seconds worth of stereo f32 at the
@@ -224,7 +276,7 @@ impl Player {
         let shared_for_thread = shared.clone();
         let ctx_for_thread = ctx.clone();
         let path_for_thread = path.to_path_buf();
-        thread::spawn(move || {
+        let decode_thread = thread::spawn(move || {
             if let Err(e) = run_decode_pipeline(
                 path_for_thread,
                 cmd_rx,
@@ -269,6 +321,7 @@ impl Player {
         Ok(Self {
             shared,
             cmd_tx,
+            decode_thread: Some(decode_thread),
             _audio_stream: audio_stream,
             texture: None,
             yuv_renderer: wgpu
@@ -293,6 +346,9 @@ impl Player {
     pub fn play(&mut self) {
         let _ = self.cmd_tx.send(Command::Play);
         self.playing_cached = true;
+        if let Some(stream) = &self._audio_stream {
+            let _ = stream.play();
+        }
         if !self.has_audio() {
             self.no_audio_clock_origin = Some(Instant::now());
             self.no_audio_clock_base_us = self.shared.audio_clock_us.load(Ordering::Relaxed);
@@ -302,6 +358,9 @@ impl Player {
     pub fn pause(&mut self) {
         let _ = self.cmd_tx.send(Command::Pause);
         self.playing_cached = false;
+        if let Some(stream) = &self._audio_stream {
+            let _ = stream.pause();
+        }
         if !self.has_audio() {
             // Freeze the clock at its current value.
             if let Some(origin) = self.no_audio_clock_origin.take() {
@@ -313,10 +372,46 @@ impl Player {
     }
 
     pub fn seek(&mut self, fraction: f32) {
+        // Lock the display pipeline synchronously before the demuxer
+        // even sees the command: clear the queue so any pre-seek
+        // frames still buffered there vanish, set `min_display_pts_us`
+        // to MAX so tick() can't accidentally display a stale frame
+        // while the demuxer is still processing, and raise
+        // `clock_frozen` so the priming path is the only one that
+        // can surface the next rendered frame. The demuxer's seek
+        // handler will overwrite `min_display_pts_us` with the real
+        // target shortly afterwards.
+        self.shared
+            .min_display_pts_us
+            .store(i64::MAX, Ordering::Relaxed);
+        self.shared.video_queue.lock().unwrap().clear();
         self.shared
             .clock_frozen
             .store(true, Ordering::Relaxed);
         let _ = self.cmd_tx.send(Command::Seek(fraction.clamp(0.0, 1.0)));
+        // Briefly wait for the demuxer to actually pick up the new
+        // seek target (it overwrites `min_display_pts_us` from MAX
+        // to the real target inside its seek handler). Without this
+        // short handoff, subsequent tick() calls on the main thread
+        // can race with the demuxer and see stale state, which has
+        // been observed as the GUI not updating after back-to-back
+        // seeks / frame-step keypresses.
+        let deadline = Instant::now() + Duration::from_millis(30);
+        while Instant::now() < deadline {
+            if self
+                .shared
+                .min_display_pts_us
+                .load(Ordering::Relaxed)
+                != i64::MAX
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        // Make sure egui schedules another update cycle so that
+        // when the decoder worker pushes the post-seek frame shortly
+        // afterwards, tick() actually runs and surfaces it.
+        self.egui_ctx.request_repaint();
         if !self.has_audio() {
             let duration = self.duration_ms() * 1000;
             let target = (duration as f32 * fraction.clamp(0.0, 1.0)) as i64;
@@ -353,6 +448,128 @@ impl Player {
         self.current_clock_us() / 1000
     }
 
+    /// Average frame interval in microseconds, derived from the
+    /// source video's `avg_frame_rate`. Used by the GUI to implement
+    /// frame-step seeking (comma / period keys).
+    pub fn frame_interval_us(&self) -> i64 {
+        self.shared.state.lock().unwrap().frame_interval_us.max(1_000)
+    }
+
+    /// Step by `delta` frames. Forward steps preferentially consume
+    /// frames the worker has already decoded and buffered past the
+    /// current display position — this avoids the cost of calling
+    /// `av_seek_frame` back to the enclosing keyframe and
+    /// re-decoding ~a GOP's worth of content, which for long-GOP
+    /// HEVC can take hundreds of ms per step and feel frozen.
+    /// Backward steps always fall back to a real seek.
+    pub fn step_frames(&mut self, delta: i32) {
+        let duration_us = self.shared.state.lock().unwrap().duration_us;
+        if duration_us <= 0 {
+            return;
+        }
+
+        if delta > 0 {
+            // Try to advance through the already-decoded queue
+            // first. If there's a buffered frame immediately after
+            // the currently displayed one, just show it. No seek,
+            // no decode, no stall.
+            let mut queue = self.shared.video_queue.lock().unwrap();
+            let cutoff = self.last_uploaded_pts_us;
+            // Drop anything at/before the current display pts so
+            // the next pop yields the following frame.
+            while let Some(front) = queue.front() {
+                if front.pts_us <= cutoff {
+                    queue.pop_front();
+                } else {
+                    break;
+                }
+            }
+            if let Some(frame) = queue.pop_front() {
+                drop(queue);
+                self.display_frame(frame);
+                return;
+            }
+            // Queue didn't have anything buffered — fall through
+            // to a real seek below.
+            drop(queue);
+        }
+
+        let interval = self.frame_interval_us();
+        let current_us = self.current_clock_us();
+        if delta < 0 {
+            // Backward step: "first frame ≥ target" semantics can
+            // round back to `current` when the `target_us =
+            // current - interval` value falls between actual
+            // frames (variable frame rate / avg_frame_rate
+            // mismatch), producing a visible oscillation. Seek to
+            // a point safely several frames back, then pick the
+            // LATEST decoded frame strictly before `current_us`.
+            let back = (interval.max(16_000)) * (-delta as i64) * 4;
+            let target_us = (current_us - back).max(0);
+            let frac = (target_us as f32 / duration_us as f32).clamp(0.0, 1.0);
+            self.seek(frac);
+            // Wait briefly for the worker to fill the queue with
+            // post-seek frames, then pop the latest frame whose
+            // pts is strictly less than `current_us`. The 800 ms
+            // deadline covers long-GOP HW decode from a keyframe
+            // to the seek target.
+            let cutoff = current_us;
+            let deadline = Instant::now() + Duration::from_millis(800);
+            while Instant::now() < deadline {
+                let mut queue = self.shared.video_queue.lock().unwrap();
+                let mut latest_back: Option<VideoFrame> = None;
+                while let Some(front) = queue.front() {
+                    if front.pts_us < cutoff {
+                        latest_back = queue.pop_front();
+                    } else {
+                        break;
+                    }
+                }
+                if let Some(frame) = latest_back {
+                    drop(queue);
+                    self.display_frame(frame);
+                    return;
+                }
+                drop(queue);
+                thread::sleep(Duration::from_millis(8));
+            }
+            return;
+        }
+
+        let target_us =
+            (current_us + interval * delta as i64).clamp(0, duration_us - interval);
+        let frac = (target_us as f32 / duration_us as f32).clamp(0.0, 1.0);
+        self.seek(frac);
+    }
+
+    /// Upload `frame` to the active texture, update the bookkeeping
+    /// atoms so subsequent ticks/seeks see a consistent post-step
+    /// state, and request a repaint. Shared between the forward- and
+    /// backward-step paths.
+    fn display_frame(&mut self, frame: VideoFrame) {
+        let (w, h) = match &frame.payload {
+            VideoFramePayload::Rgba8Srgb { width, height, .. }
+            | VideoFramePayload::Rgba16Unorm { width, height, .. }
+            | VideoFramePayload::Nv12 { width, height, .. } => (*width, *height),
+        };
+        self.intrinsic_size = (w, h);
+        let new_pts = frame.pts_us;
+        if self.wgpu.is_some() {
+            self.upload_wgpu(frame.payload);
+        } else if let VideoFramePayload::Rgba8Srgb { image, .. } = frame.payload {
+            self.upload_egui(image);
+            self.last_upload_was_nv12 = false;
+        }
+        self.last_uploaded_pts_us = new_pts;
+        self.shared
+            .audio_clock_us
+            .store(new_pts, Ordering::Relaxed);
+        self.shared
+            .clock_frozen
+            .store(false, Ordering::Relaxed);
+        self.egui_ctx.request_repaint();
+    }
+
     pub fn size(&self) -> (u32, u32) {
         let s = self.shared.state.lock().unwrap();
         (s.width, s.height)
@@ -360,6 +577,16 @@ impl Player {
 
     pub fn has_audio(&self) -> bool {
         self.shared.state.lock().unwrap().has_audio
+    }
+
+    /// True while the player is in post-seek priming, i.e. the
+    /// display clock is frozen waiting for the first post-seek frame
+    /// to land. The GUI uses this to keep requesting repaints while
+    /// paused so the target frame actually renders.
+    pub fn is_seeking(&self) -> bool {
+        self.shared
+            .clock_frozen
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn texture(&self) -> Option<&egui::TextureHandle> {
@@ -400,23 +627,91 @@ impl Player {
             }
         }
 
+        let clock_frozen = self
+            .shared
+            .clock_frozen
+            .load(Ordering::Relaxed);
         let clock_us = self.current_clock_us();
 
+        let min_pts = self
+            .shared
+            .min_display_pts_us
+            .load(Ordering::Relaxed);
+
+        // While paused (and not in post-seek warmup), the display
+        // has already been chosen by the last seek / step_frames
+        // call. Don't drain the demuxer-filled lookahead queue
+        // here: that lookahead exists so the next step-forward
+        // can reuse it, and popping it eagerly would "scroll
+        // forward" through buffered frames — which on high-fps
+        // content makes step_frames(-1) appear to jump forward
+        // because tick()'s ±15 ms tolerance sweeps up the next
+        // frame every time the clock unfreezes.
+        if !self.playing_cached && !clock_frozen {
+            return;
+        }
         let best = {
             let mut queue = self.shared.video_queue.lock().unwrap();
-            let mut best: Option<VideoFrame> = None;
-            while let Some(front) = queue.front() {
-                if front.pts_us <= clock_us + 15_000 {
-                    best = queue.pop_front();
-                } else {
-                    break;
+            if clock_frozen {
+                // Post-seek warmup: the clock is intentionally frozen
+                // at the seek target until the first decoded frame
+                // arrives. Pop the first frame at or past the seek
+                // target, discarding any stale frames that leaked
+                // through the flush-race window.
+                let mut chosen: Option<VideoFrame> = None;
+                while let Some(front) = queue.front() {
+                    if front.pts_us >= min_pts {
+                        chosen = queue.pop_front();
+                        break;
+                    } else {
+                        let _ = queue.pop_front();
+                    }
                 }
+                chosen
+            } else {
+                let mut best: Option<VideoFrame> = None;
+                while let Some(front) = queue.front() {
+                    // Also honour min_pts here in case a stale frame
+                    // leaked through after a seek but before the
+                    // worker cleared the queue on its Flush handler.
+                    if front.pts_us < min_pts {
+                        let _ = queue.pop_front();
+                        continue;
+                    }
+                    if front.pts_us <= clock_us + 15_000 {
+                        best = queue.pop_front();
+                    } else {
+                        break;
+                    }
+                }
+                best
             }
-            best
         };
 
         if let Some(frame) = best {
             if frame.pts_us != self.last_uploaded_pts_us {
+                // If the clock is frozen (post-seek warmup), unfreeze
+                // it and re-anchor to this frame's pts so playback
+                // resumes from exactly this frame instead of jumping
+                // forward by the decoder-warmup latency.
+                if self
+                    .shared
+                    .clock_frozen
+                    .load(Ordering::Relaxed)
+                {
+                    self.shared
+                        .audio_clock_us
+                        .store(frame.pts_us, Ordering::Relaxed);
+                    self.shared
+                        .clock_frozen
+                        .store(false, Ordering::Relaxed);
+                    // For the no-audio wall-clock path, also reset
+                    // the wall-clock origin so it advances from here.
+                    if !self.has_audio() && self.playing_cached {
+                        self.no_audio_clock_origin = Some(Instant::now());
+                        self.no_audio_clock_base_us = frame.pts_us;
+                    }
+                }
                 let (w, h) = match &frame.payload {
                     VideoFramePayload::Rgba8Srgb { width, height, .. }
                     | VideoFramePayload::Rgba16Unorm { width, height, .. }
@@ -650,12 +945,24 @@ impl Player {
             let y_view = y_texture.create_view(&wgpu::TextureViewDescriptor::default());
             let uv_view = uv_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-            let uniform_buffer = Arc::new(backend.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("nv12_uniform"),
-                size: std::mem::size_of::<[f32; 8]>() as u64,
+            // Uniform buffer holding the NDC rect (left, top, right,
+            // bottom) for the vertex shader. Initialised to a
+            // full-NDC quad so the first frame draws even before
+            // `set_nv12_ndc_rect` is called.
+            let ndc_buffer = backend.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("nv12_ndc_uniform"),
+                size: 16,
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
-            }));
+            });
+            let initial_ndc: [f32; 4] = [-1.0, 1.0, 1.0, -1.0];
+            let initial_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    initial_ndc.as_ptr() as *const u8,
+                    std::mem::size_of::<[f32; 4]>(),
+                )
+            };
+            backend.queue.write_buffer(&ndc_buffer, 0, initial_bytes);
 
             let bind_group = Arc::new(backend.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("nv12_bind_group"),
@@ -663,19 +970,19 @@ impl Player {
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
-                        resource: uniform_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
                         resource: wgpu::BindingResource::TextureView(&y_view),
                     },
                     wgpu::BindGroupEntry {
-                        binding: 2,
+                        binding: 1,
                         resource: wgpu::BindingResource::TextureView(&uv_view),
                     },
                     wgpu::BindGroupEntry {
-                        binding: 3,
+                        binding: 2,
                         resource: wgpu::BindingResource::Sampler(&renderer.sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: ndc_buffer.as_entire_binding(),
                     },
                 ],
             }));
@@ -683,8 +990,8 @@ impl Player {
             self.nv12_state = Some(Nv12GpuState {
                 y_texture,
                 uv_texture,
+                ndc_buffer,
                 bind_group,
-                uniform_buffer,
                 width,
                 height,
             });
@@ -736,47 +1043,98 @@ impl Player {
         );
     }
 
-    /// Emit an `egui_wgpu::Callback` that will draw the current NV12
-    /// video frame into `rect` on the egui painter. Returns `None`
-    /// if the player is not currently on the NV12 path or the state
-    /// hasn't been initialized yet (e.g., before the first frame).
+    /// Emit an `egui_wgpu::Callback` that draws the current NV12
+    /// video into `video_rect`. egui_wgpu sets the wgpu viewport to
+    /// this rect (in pixels) before the callback runs, so our shader
+    /// just emits a full NDC quad.
     pub fn nv12_paint_callback(
         &self,
-        screen_rect: egui::Rect,
         video_rect: egui::Rect,
-        uv_rect: [f32; 4],
     ) -> Option<egui::epaint::PaintCallback> {
         let renderer = self.yuv_renderer.as_ref()?;
         let state = self.nv12_state.as_ref()?;
-
-        let sw = screen_rect.width().max(1.0);
-        let sh = screen_rect.height().max(1.0);
-        let ndc_x = (video_rect.left() - screen_rect.left()) / sw * 2.0 - 1.0;
-        let ndc_y = 1.0 - (video_rect.top() - screen_rect.top()) / sh * 2.0;
-        let ndc_w = video_rect.width() / sw * 2.0;
-        let ndc_h = -(video_rect.height() / sh * 2.0);
-
         let cb = Nv12PaintCallback {
             pipeline: renderer.pipeline.clone(),
             bind_group: state.bind_group.clone(),
-            uniform_buffer: state.uniform_buffer.clone(),
-            uniform_data: [
-                ndc_x, ndc_y, ndc_w, ndc_h, uv_rect[0], uv_rect[1], uv_rect[2], uv_rect[3],
-            ],
         };
+        Some(egui_wgpu::Callback::new_paint_callback(video_rect, cb))
+    }
 
-        Some(egui::epaint::PaintCallback {
-            rect: video_rect,
-            callback: std::sync::Arc::new(egui_wgpu::Callback::new_paint_callback(
-                video_rect, cb,
-            )),
-        })
+    /// Update the NV12 vertex shader's quad rect for the next frame.
+    /// Caller passes the unclamped video rect (in egui points) and the
+    /// caller's own viewport metrics. We compute the equivalent
+    /// quad-in-NDC inside the egui_wgpu-clamped viewport so the video
+    /// translates correctly when panning pushes the rect off-screen
+    /// (the rasterizer clips the over-extended quad via the scissor).
+    pub fn set_nv12_render_rect(
+        &self,
+        video_rect: egui::Rect,
+        screen_size_points: egui::Vec2,
+        pixels_per_point: f32,
+    ) {
+        let backend = match self.wgpu.as_ref() {
+            Some(b) => b,
+            None => return,
+        };
+        let state = match self.nv12_state.as_ref() {
+            Some(s) => s,
+            None => return,
+        };
+        let scr_w = screen_size_points.x * pixels_per_point;
+        let scr_h = screen_size_points.y * pixels_per_point;
+        let rect_l = video_rect.min.x * pixels_per_point;
+        let rect_t = video_rect.min.y * pixels_per_point;
+        let rect_r = video_rect.max.x * pixels_per_point;
+        let rect_b = video_rect.max.y * pixels_per_point;
+        // Replicate epaint::ViewportInPixels::from_points clamping.
+        let vp_l = rect_l.max(0.0).min(scr_w);
+        let vp_t = rect_t.max(0.0).min(scr_h);
+        let vp_r = rect_r.max(vp_l).min(scr_w);
+        let vp_b = rect_b.max(vp_t).min(scr_h);
+        let vp_w = (vp_r - vp_l).max(1.0);
+        let vp_h = (vp_b - vp_t).max(1.0);
+        // NDC X: -1 at viewport left, +1 at viewport right.
+        let ndc_l = (rect_l - vp_l) / vp_w * 2.0 - 1.0;
+        let ndc_r = (rect_r - vp_l) / vp_w * 2.0 - 1.0;
+        // NDC Y: +1 at top, -1 at bottom (wgpu).
+        let ndc_t = 1.0 - (rect_t - vp_t) / vp_h * 2.0;
+        let ndc_b = 1.0 - (rect_b - vp_t) / vp_h * 2.0;
+        let data: [f32; 4] = [ndc_l, ndc_t, ndc_r, ndc_b];
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                data.as_ptr() as *const u8,
+                std::mem::size_of::<[f32; 4]>(),
+            )
+        };
+        backend.queue.write_buffer(&state.ndc_buffer, 0, bytes);
     }
 }
 
 impl Drop for Player {
     fn drop(&mut self) {
+        self.shared.stopping.store(true, Ordering::Relaxed);
         let _ = self.cmd_tx.send(Command::Stop);
+        if let Some(stream) = &self._audio_stream {
+            let _ = stream.pause();
+        }
+        // Wait briefly for the decode thread to exit cleanly, but
+        // don't block forever: if it's wedged (e.g. in ffmpeg I/O),
+        // we'd rather leak the thread than freeze the GUI shutdown.
+        // The OS will clean up when the process exits.
+        if let Some(h) = self.decode_thread.take() {
+            let deadline = Instant::now() + Duration::from_millis(300);
+            while Instant::now() < deadline {
+                if h.is_finished() {
+                    let _ = h.join();
+                    return;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            // Timed out — detach. Handle drop leaves the thread
+            // running, but since Player::drop is only called when
+            // the owning window is closing, that's fine.
+            std::mem::drop(h);
+        }
     }
 }
 
@@ -820,6 +1178,12 @@ fn setup_audio_stream(
                 move |data: &mut [f32], _| {
                     let volume = f32::from_bits(shared_cb.volume_bits.load(Ordering::Relaxed));
                     let frozen = shared_cb.clock_frozen.load(Ordering::Relaxed);
+                    // Drain the ring buffer if a seek just happened,
+                    // so we don't continue playing stale audio from
+                    // before the seek target.
+                    if shared_cb.audio_drain_flag.swap(false, Ordering::Relaxed) {
+                        while consumer.try_pop().is_some() {}
+                    }
                     let mut played_frames = 0usize;
                     // data is interleaved `channels` samples per frame.
                     let frames = data.len() / channels.max(1);
@@ -848,9 +1212,10 @@ fn setup_audio_stream(
         other => return Err(format!("unsupported cpal sample format: {:?}", other)),
     };
 
-    stream
-        .play()
-        .map_err(|e| format!("cpal stream play: {}", e))?;
+    // Do NOT call stream.play() here — the stream starts paused so
+    // the Player sits silent until Player::play() explicitly resumes
+    // it. Without this, cpal immediately starts advancing the audio
+    // clock even though the Player is logically in the Paused state.
     Ok(stream)
 }
 
@@ -880,12 +1245,18 @@ fn run_decode_pipeline(
     let duration_us = ictx.duration();
 
     // --- Video stream ---
-    let (video_stream_index, video_time_base) = {
+    let (video_stream_index, video_time_base, video_frame_interval_us) = {
         let stream = ictx
             .streams()
             .best(ffmpeg::media::Type::Video)
             .ok_or_else(|| "no video stream".to_string())?;
-        (stream.index(), stream.time_base())
+        let rate = stream.avg_frame_rate();
+        let frame_us = if rate.denominator() > 0 && rate.numerator() > 0 {
+            1_000_000_i64 * rate.denominator() as i64 / rate.numerator() as i64
+        } else {
+            33_333
+        };
+        (stream.index(), stream.time_base(), frame_us)
     };
 
     // Re-enabled now that decode threads are split: HW transfer lives
@@ -962,18 +1333,30 @@ fn run_decode_pipeline(
         state.width = video_src_w;
         state.height = video_src_h;
         state.has_audio = audio_stream_index.is_some();
+        state.frame_interval_us = video_frame_interval_us;
         state.player_state = PlayerState::Paused;
     }
     egui_ctx.request_repaint();
 
     // --- Spawn the two decode workers ---
-    // Bounded channels: demuxer will block when the decoder can't keep
-    // up, so we don't race ahead and buffer the entire file in memory.
-    // These sizes give ~1 second of 60fps video lead time and ~1 second
-    // of 48kHz audio, which is plenty for smooth playback.
-    let (video_tx, video_rx) = mpsc::sync_channel::<DecodeMsg>(64);
+    // Unbounded channels so the demuxer never blocks on `send` while
+    // waiting for the workers to catch up. Blocking here would
+    // prevent the demuxer from reaching its `cmd_rx.try_recv()` at
+    // the top of the loop, which is what causes rapid-seek commands
+    // to be queued but never processed until playback resumes.
+    // Runtime back-pressure is still applied via the `video_queue`
+    // length check above (demuxer sleeps when the decoded frame
+    // queue is full), so in normal playback the channels don't
+    // grow unbounded — they only accumulate during the brief
+    // priming window after a seek, where we *want* the demuxer to
+    // run ahead.
+    // Bounded channels cap how far the demuxer can race ahead of
+    // the workers, keeping memory bounded. Flushes are signalled
+    // out-of-band via `shared.flush_seq`, so send-side blocking
+    // here can't deadlock seeks even when the worker is paused.
+    let (video_tx, video_rx) = mpsc::sync_channel::<DecodeMsg>(8);
     let (audio_tx_opt, audio_rx_opt) = if audio_stream_index.is_some() {
-        let (tx, rx) = mpsc::sync_channel::<DecodeMsg>(64);
+        let (tx, rx) = mpsc::sync_channel::<DecodeMsg>(16);
         (Some(tx), Some(rx))
     } else {
         (None, None)
@@ -994,78 +1377,179 @@ fn run_decode_pipeline(
         })
     };
     let audio_handle = match (audio_decoder, audio_resampler, audio_rx_opt) {
-        (Some(dec), Some(res), Some(rx)) => Some(thread::spawn(move || {
-            audio_decode_loop(dec, res, rx, audio_producer);
-        })),
+        (Some(dec), Some(res), Some(rx)) => {
+            let shared_a = shared.clone();
+            Some(thread::spawn(move || {
+                audio_decode_loop(dec, res, rx, shared_a, audio_producer);
+            }))
+        }
         _ => None,
     };
 
     // --- Demuxer loop ---
     let mut paused = true;
-    let mut looping = true;
+    let mut looping = false;
     let mut eof = false;
+    // When true, the demuxer reads packets regardless of `paused`
+    // state until the video worker has successfully pushed at least
+    // one post-seek frame. This ensures the user sees the new frame
+    // at the seek target even while playback is paused.
+    let mut priming_after_seek = false;
+    // Safety cap so we don't spin forever on a broken file.
+    let mut prime_packets_read: u32 = 0;
+    const MAX_PRIME_PACKETS: u32 = 600;
+
+    // Carried across iterations: the packet-routing back-pressure
+    // helper can pull commands out of cmd_rx when it has to wait for
+    // channel space, and it stashes them here so the next iteration
+    // of the main loop processes them instead of losing them.
+    let mut pending_seek: Option<f32> = None;
+    let mut pending_play: Option<bool> = None;
 
     'main: loop {
-        // Drain any pending commands.
+        // Drain all pending commands in one go and coalesce them.
+        // Multiple queued `Seek`s collapse into the latest — so a
+        // rapid drag on the scrub bar never processes a backlog.
+        let mut should_stop = false;
         loop {
             match cmd_rx.try_recv() {
-                Ok(Command::Play) => {
-                    paused = false;
-                    eof = false;
-                    let mut state = shared.state.lock().unwrap();
-                    if state.player_state != PlayerState::Error {
-                        state.player_state = PlayerState::Playing;
-                    }
-                }
-                Ok(Command::Pause) => {
-                    paused = true;
-                    let mut state = shared.state.lock().unwrap();
-                    if state.player_state != PlayerState::Error {
-                        state.player_state = PlayerState::Paused;
-                    }
-                }
-                Ok(Command::Seek(frac)) => {
-                    let target_us =
-                        (duration_us as f32 * frac.clamp(0.0, 1.0)) as i64;
-                    let _ = ictx.seek(target_us, ..target_us + duration_us / 20);
-                    unsafe {
-                        let fctx = ictx.as_mut_ptr();
-                        if !fctx.is_null() && !(*fctx).pb.is_null() {
-                            (*(*fctx).pb).eof_reached = 0;
-                            (*(*fctx).pb).error = 0;
-                            avformat_flush(fctx);
-                        }
-                    }
-                    let _ = video_tx.send(DecodeMsg::Flush);
-                    if let Some(ref tx) = audio_tx_opt {
-                        let _ = tx.send(DecodeMsg::Flush);
-                    }
-                    shared.video_queue.lock().unwrap().clear();
-                    shared.audio_clock_us.store(target_us, Ordering::Relaxed);
-                    shared.clock_frozen.store(false, Ordering::Relaxed);
-                    eof = false;
-                }
+                Ok(Command::Play) => pending_play = Some(true),
+                Ok(Command::Pause) => pending_play = Some(false),
+                Ok(Command::Seek(frac)) => pending_seek = Some(frac),
                 Ok(Command::SetLooping(l)) => looping = l,
-                Ok(Command::Stop) => break 'main,
+                Ok(Command::Stop) => {
+                    should_stop = true;
+                    break;
+                }
                 Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => break 'main,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    should_stop = true;
+                    break;
+                }
             }
         }
+        if should_stop {
+            break 'main;
+        }
+        if let Some(play) = pending_play.take() {
+            paused = !play;
+            eof = false;
+            let mut state = shared.state.lock().unwrap();
+            if state.player_state != PlayerState::Error {
+                state.player_state = if play {
+                    PlayerState::Playing
+                } else {
+                    PlayerState::Paused
+                };
+            }
+        }
+        if let Some(frac) = pending_seek.take() {
+            let target_us =
+                (duration_us as f32 * frac.clamp(0.0, 1.0)) as i64;
+            // av_seek_frame(..., BACKWARD) lands on a keyframe at or
+            // before the target. Combined with the `min_display_pts_us`
+            // drop on the worker, that gives frame-accurate seeking —
+            // decoder gets the keyframe, walks forward until the
+            // target, then the first displayed frame is the first
+            // one at or past the target.
+            let seek_rc = unsafe {
+                av_seek_frame(
+                    ictx.as_mut_ptr(),
+                    -1,
+                    target_us,
+                    AVSEEK_FLAG_BACKWARD,
+                )
+            };
+            let _ = seek_rc;
+            unsafe {
+                let fctx = ictx.as_mut_ptr();
+                if !fctx.is_null() && !(*fctx).pb.is_null() {
+                    (*(*fctx).pb).eof_reached = 0;
+                    (*(*fctx).pb).error = 0;
+                }
+                if !fctx.is_null() {
+                    avformat_flush(fctx);
+                }
+            }
+            // Set every gate BEFORE we send the Flush message,
+            // because the worker may process the Flush + subsequent
+            // packets before the demuxer finishes this handler. If
+            // the gates aren't all set first, post-Flush frames can
+            // slip through with stale min_display_pts_us (and end
+            // up being displayed at completely wrong timestamps).
+            shared
+                .min_display_pts_us
+                .store(target_us, Ordering::Relaxed);
+            shared
+                .post_seek_frames_pushed
+                .store(0, Ordering::Relaxed);
+            shared
+                .flush_pending
+                .store(true, Ordering::Relaxed);
+            shared.audio_clock_us.store(target_us, Ordering::Relaxed);
+            shared.clock_frozen.store(true, Ordering::Relaxed);
+            shared
+                .audio_drain_flag
+                .store(true, Ordering::Relaxed);
+            // Bump the flush counter so workers notice on their
+            // next decode iteration. Sending a Flush *message* via
+            // the bounded channel can deadlock if the channel is
+            // full and the worker is parked in back-pressure (which
+            // happens on pause-then-seek).
+            shared.flush_seq.fetch_add(1, Ordering::Relaxed);
+            shared.video_queue.lock().unwrap().clear();
+            eof = false;
+            priming_after_seek = true;
+            prime_packets_read = 0;
+        }
 
-        if paused {
-            thread::sleep(Duration::from_millis(10));
-            continue;
+        if priming_after_seek {
+            let pushed = shared
+                .post_seek_frames_pushed
+                .load(Ordering::Relaxed);
+            if pushed > 0 || prime_packets_read >= MAX_PRIME_PACKETS {
+                priming_after_seek = false;
+            }
+        }
+        // While paused, keep the demuxer routing until the display
+        // queue is well-populated. This lets `Player::step_frames`
+        // and the seek bar consume many buffered frames without
+        // falling back into the expensive full-seek-and-decode
+        // path. `PAUSED_FILL_TARGET` is the depth we aim for; once
+        // the queue has that many buffered frames we sleep until
+        // tick() drains some.
+        if paused && !priming_after_seek {
+            const PAUSED_FILL_TARGET: usize = 12;
+            let qlen = shared.video_queue.lock().unwrap().len();
+            if qlen >= PAUSED_FILL_TARGET {
+                thread::sleep(Duration::from_millis(10));
+                continue;
+            }
         }
         if eof {
             thread::sleep(Duration::from_millis(30));
             continue;
         }
 
-        // Light back-pressure: don't pile up more than ~1 second of
-        // decoded video ahead of playback. The video decoder is much
-        // cheaper than display at this queue depth.
+        // Back-pressure: cap the decoded-video queue so it doesn't
+        // grow without bound. CRITICAL: only stall once the clock has
+        // actually started advancing. During startup the audio decoder
+        // needs its first packets to arrive through the demuxer before
+        // it can produce samples that move the clock. Stalling on
+        // depth alone here deadlocks high-fps content (e.g. HEVC
+        // 60fps) where ~16 decoded frames span less than one audio
+        // decode cycle — the video queue hits the cap before any
+        // audio packet has been routed, so audio never starts, the
+        // clock never ticks, tick() never pops, and the demuxer
+        // stays stalled forever.
+        let clock_us = shared.audio_clock_us.load(Ordering::Relaxed);
         let video_queue_len = shared.video_queue.lock().unwrap().len();
-        if video_queue_len > 16 {
+        if video_queue_len > 48 && clock_us > 0 {
+            thread::sleep(Duration::from_millis(3));
+            continue;
+        }
+        if video_queue_len > 240 {
+            // Hard safety cap regardless of clock state.
             thread::sleep(Duration::from_millis(3));
             continue;
         }
@@ -1076,6 +1560,34 @@ fn run_decode_pipeline(
             Ok(()) => {}
             Err(ffmpeg::Error::Eof) => {
                 if looping {
+                    // Wait for playback to actually catch up to the
+                    // end of the file before looping. Without this,
+                    // fast-decoding short files have the demuxer
+                    // reaching EOF in ~200 ms while audio has only
+                    // played ~50 ms — we'd then reset the clock to
+                    // 0, race through again, and never make progress.
+                    let duration_us =
+                        shared.state.lock().unwrap().duration_us;
+                    loop {
+                        let clock_us =
+                            shared.audio_clock_us.load(Ordering::Relaxed);
+                        let video_queue_len =
+                            shared.video_queue.lock().unwrap().len();
+                        if duration_us <= 0
+                            || (clock_us >= duration_us - 250_000
+                                && video_queue_len == 0)
+                        {
+                            break;
+                        }
+                        // Respond to incoming commands while waiting.
+                        if let Ok(cmd) = cmd_rx.try_recv() {
+                            match cmd {
+                                Command::Play | Command::Pause => {}
+                                _ => break,
+                            }
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
                     // Full reset to start using av_seek_frame with
                     // BACKWARD|ANY flags, an explicit byte-zero
                     // avio_seek fallback, clear eof_reached, and
@@ -1118,20 +1630,24 @@ fn run_decode_pipeline(
                         continue;
                     }
                     // Feed the verify packet through the normal path.
-                    let _ = video_tx.send(DecodeMsg::Flush);
-                    if let Some(ref tx) = audio_tx_opt {
-                        let _ = tx.send(DecodeMsg::Flush);
-                    }
+                    shared.flush_seq.fetch_add(1, Ordering::Relaxed);
                     shared.video_queue.lock().unwrap().clear();
+                    shared
+                        .audio_drain_flag
+                        .store(true, Ordering::Relaxed);
                     shared.audio_clock_us.store(0, Ordering::Relaxed);
+                    shared
+                        .min_display_pts_us
+                        .store(0, Ordering::Relaxed);
                     // Dispatch the verification packet so we don't
                     // waste it.
                     let vi = verify_pkt.stream();
+                    let tag = shared.flush_seq.load(Ordering::Relaxed);
                     if vi == video_stream_index {
-                        let _ = video_tx.send(DecodeMsg::Packet(verify_pkt));
+                        let _ = video_tx.send(DecodeMsg::Packet(verify_pkt, tag));
                     } else if Some(vi) == audio_stream_index {
                         if let Some(ref tx) = audio_tx_opt {
-                            let _ = tx.send(DecodeMsg::Packet(verify_pkt));
+                            let _ = tx.send(DecodeMsg::Packet(verify_pkt, tag));
                         }
                     }
                     continue;
@@ -1150,15 +1666,71 @@ fn run_decode_pipeline(
 
         let packet_idx = packet.stream();
         if packet_idx == video_stream_index {
-            if video_tx.send(DecodeMsg::Packet(packet)).is_err() {
-                break 'main;
+            let tag = shared.flush_seq.load(Ordering::Relaxed);
+            let mut msg = Some(DecodeMsg::Packet(packet, tag));
+            loop {
+                match video_tx.try_send(msg.take().unwrap()) {
+                    Ok(()) => break,
+                    Err(mpsc::TrySendError::Full(m)) => {
+                        msg = Some(m);
+                        if shared.stopping.load(Ordering::Relaxed) {
+                            break 'main;
+                        }
+                        // Peek for a pending seek/stop so we don't
+                        // stall here while the user is waiting.
+                        if let Ok(cmd) = cmd_rx.try_recv() {
+                            match cmd {
+                                Command::Play => pending_play = Some(true),
+                                Command::Pause => pending_play = Some(false),
+                                Command::Seek(f) => {
+                                    pending_seek = Some(f);
+                                    // Drop the in-flight stale
+                                    // packet; the seek path
+                                    // will flush anyway.
+                                    break;
+                                }
+                                Command::SetLooping(l) => looping = l,
+                                Command::Stop => break 'main,
+                            }
+                        }
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(mpsc::TrySendError::Disconnected(_)) => break 'main,
+                }
             }
         } else if Some(packet_idx) == audio_stream_index {
             if let Some(ref tx) = audio_tx_opt {
-                if tx.send(DecodeMsg::Packet(packet)).is_err() {
-                    break 'main;
+                let tag = shared.flush_seq.load(Ordering::Relaxed);
+                let mut msg = Some(DecodeMsg::Packet(packet, tag));
+                loop {
+                    match tx.try_send(msg.take().unwrap()) {
+                        Ok(()) => break,
+                        Err(mpsc::TrySendError::Full(m)) => {
+                            msg = Some(m);
+                            if shared.stopping.load(Ordering::Relaxed) {
+                                break 'main;
+                            }
+                            if let Ok(cmd) = cmd_rx.try_recv() {
+                                match cmd {
+                                    Command::Play => pending_play = Some(true),
+                                    Command::Pause => pending_play = Some(false),
+                                    Command::Seek(f) => {
+                                        pending_seek = Some(f);
+                                        break;
+                                    }
+                                    Command::SetLooping(l) => looping = l,
+                                    Command::Stop => break 'main,
+                                }
+                            }
+                            thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(mpsc::TrySendError::Disconnected(_)) => break 'main,
+                    }
                 }
             }
+        }
+        if priming_after_seek {
+            prime_packets_read += 1;
         }
     }
 
@@ -1173,12 +1745,46 @@ fn run_decode_pipeline(
     Ok(())
 }
 
+const WORKER_QUEUE_CAP: usize = 16;
+
+/// Push a decoded video frame into the shared display queue, then
+/// (after pushing) park the worker if the queue is now at capacity.
+/// This is post-push back-pressure: we always make at least one
+/// frame available — important during post-seek priming when tick()
+/// needs a frame to land before it can clear `clock_frozen` — and
+/// only stall once that frame is buffered. Exits on the shared
+/// `stopping` flag so `decode_thread.join()` can return promptly.
+/// Returns true when the frame actually landed in the shared queue.
+/// Callers must consult this result before bumping
+/// `post_seek_frames_pushed`, otherwise the demuxer can incorrectly
+/// conclude that seek priming is done and stop routing packets.
+fn push_with_cap(shared: &Arc<Shared>, frame: VideoFrame, last_flush_seq: u64) -> bool {
+    let mut slot = Some(frame);
+    for _ in 0..400 {
+        if shared.stopping.load(Ordering::Relaxed) {
+            return false;
+        }
+        if shared.flush_seq.load(Ordering::Relaxed) != last_flush_seq {
+            return false;
+        }
+        {
+            let mut q = shared.video_queue.lock().unwrap();
+            if q.len() < WORKER_QUEUE_CAP {
+                q.push_back(slot.take().expect("frame present"));
+                return true;
+            }
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    false
+}
+
 /// Video decode worker: pulls DecodeMsg from the channel, decodes,
 /// scales to RGBA, pushes finished frames into shared.video_queue.
 fn video_decode_loop(
     mut decoder: ffmpeg::decoder::Video,
     time_base: ffmpeg::Rational,
-    rx: Receiver<DecodeMsg>,
+    rx: mpsc::Receiver<DecodeMsg>,
     shared: Arc<Shared>,
     egui_ctx: egui::Context,
     high_bit_depth_enabled: bool,
@@ -1190,29 +1796,73 @@ fn video_decode_loop(
     // cfg is (src_fmt, src_w, src_h, output_is_16bit) so a transition
     // between 8- and 16-bit output forces a scaler rebuild.
     let mut scaler_cfg: Option<(ffmpeg::format::Pixel, u32, u32, bool)> = None;
+    let mut last_flush_seq: u64 = 0;
     loop {
         let msg = match rx.recv() {
             Ok(m) => m,
             Err(_) => return,
         };
+        let cur_seq = shared.flush_seq.load(Ordering::Relaxed);
+        if cur_seq != last_flush_seq {
+            last_flush_seq = cur_seq;
+            decoder.flush();
+            shared.video_queue.lock().unwrap().clear();
+            shared.flush_pending.store(false, Ordering::Relaxed);
+        }
         let packet = match msg {
             DecodeMsg::Flush => {
                 decoder.flush();
                 shared.video_queue.lock().unwrap().clear();
+                shared
+                    .flush_pending
+                    .store(false, Ordering::Relaxed);
                 continue;
             }
-            DecodeMsg::Packet(p) => p,
+            DecodeMsg::Packet(p, tag) => {
+                if tag != last_flush_seq {
+                    continue;
+                }
+                p
+            }
         };
 
         if decoder.send_packet(&packet).is_err() {
             continue;
         }
         while decoder.receive_frame(&mut video_frame).is_ok() {
+            // If a seek arrived mid-decode, drop the frame in hand
+            // and stop draining the decoder — the next outer loop
+            // iteration will service the flush.
+            let s = shared.flush_seq.load(Ordering::Relaxed);
+            if s != last_flush_seq {
+                break;
+            }
+            // Drop any frames the decoder is draining from pre-seek
+            // state — they show as "fast-forward" blur otherwise.
+            if shared.flush_pending.load(Ordering::Relaxed) {
+                continue;
+            }
             let raw_format = unsafe { (*video_frame.as_ptr()).format };
             let is_hw = raw_format == AVPixelFormat::AV_PIX_FMT_D3D11 as i32;
 
             let pts_raw = video_frame.pts().unwrap_or(0);
             let pts_us = ts_to_us(pts_raw, time_base);
+
+            // After a seek, av_seek_frame lands on the keyframe
+            // before the target. Frames between that keyframe and
+            // the seek target must be decoded (they feed the codec
+            // state) but should not be displayed, so we drop any
+            // frame whose pts is strictly before the target.
+            let min_pts = shared
+                .min_display_pts_us
+                .load(Ordering::Relaxed);
+            if pts_us < min_pts {
+                unsafe {
+                    av_frame_unref(video_frame.as_mut_ptr());
+                }
+                continue;
+            }
+
 
             let source_frame: &ffmpeg::frame::Video = if is_hw {
                 let ret = unsafe {
@@ -1266,16 +1916,25 @@ fn video_decode_loop(
                         uv_plane.extend_from_slice(&uv_src[s..s + uv_row]);
                     }
                 }
-                shared.video_queue.lock().unwrap().push_back(VideoFrame {
-                    pts_us,
-                    payload: VideoFramePayload::Nv12 {
-                        width: src_w,
-                        height: src_h,
-                        y_plane,
-                        uv_plane,
+                let pushed = push_with_cap(
+                    &shared,
+                    VideoFrame {
+                        pts_us,
+                        payload: VideoFramePayload::Nv12 {
+                            width: src_w,
+                            height: src_h,
+                            y_plane,
+                            uv_plane,
+                        },
                     },
-                });
-                egui_ctx.request_repaint();
+                    last_flush_seq,
+                );
+                if pushed {
+                    shared
+                        .post_seek_frames_pushed
+                        .fetch_add(1, Ordering::Relaxed);
+                    egui_ctx.request_repaint();
+                }
                 continue;
             }
 
@@ -1384,11 +2043,20 @@ fn video_decode_loop(
                 }
             };
 
-            shared.video_queue.lock().unwrap().push_back(VideoFrame {
-                pts_us,
-                payload,
-            });
-            egui_ctx.request_repaint();
+            let pushed = push_with_cap(
+                &shared,
+                VideoFrame {
+                    pts_us,
+                    payload,
+                },
+                last_flush_seq,
+            );
+            if pushed {
+                shared
+                    .post_seek_frames_pushed
+                    .fetch_add(1, Ordering::Relaxed);
+                egui_ctx.request_repaint();
+            }
         }
     }
 }
@@ -1403,15 +2071,19 @@ fn video_decode_loop(
 /// outputs linear RGB (the swapchain's sRGB-encoded target will
 /// re-encode on store).
 const NV12_SHADER_SRC: &str = r#"
-struct Uniforms {
-    ndc_rect: vec4<f32>,
-    uv_rect:  vec4<f32>,
-};
+@group(0) @binding(0) var y_tex: texture_2d<f32>;
+@group(0) @binding(1) var uv_tex: texture_2d<f32>;
+@group(0) @binding(2) var samp: sampler;
 
-@group(0) @binding(0) var<uniform> u: Uniforms;
-@group(0) @binding(1) var y_tex: texture_2d<f32>;
-@group(0) @binding(2) var uv_tex: texture_2d<f32>;
-@group(0) @binding(3) var samp: sampler;
+// NDC rect (left, top, right, bottom) in the current render-pass
+// viewport's coordinate space. Set from the CPU side every frame
+// based on the unclamped video_rect relative to the clamped
+// egui_wgpu viewport, so the quad is positioned correctly even when
+// panning pushes the video partially off-screen.
+struct NdcRect {
+    rect: vec4<f32>,
+};
+@group(0) @binding(3) var<uniform> ndc: NdcRect;
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
@@ -1420,7 +2092,19 @@ struct VsOut {
 
 @vertex
 fn vs_main(@builtin(vertex_index) idx: u32) -> VsOut {
-    var quad = array<vec2<f32>, 6>(
+    let l = ndc.rect.x;
+    let t = ndc.rect.y;
+    let r = ndc.rect.z;
+    let b = ndc.rect.w;
+    var positions = array<vec2<f32>, 6>(
+        vec2<f32>(l, t),
+        vec2<f32>(r, t),
+        vec2<f32>(r, b),
+        vec2<f32>(l, t),
+        vec2<f32>(r, b),
+        vec2<f32>(l, b),
+    );
+    var uvs = array<vec2<f32>, 6>(
         vec2<f32>(0.0, 0.0),
         vec2<f32>(1.0, 0.0),
         vec2<f32>(1.0, 1.0),
@@ -1428,18 +2112,9 @@ fn vs_main(@builtin(vertex_index) idx: u32) -> VsOut {
         vec2<f32>(1.0, 1.0),
         vec2<f32>(0.0, 1.0),
     );
-    let p = quad[idx];
     var out: VsOut;
-    out.pos = vec4<f32>(
-        u.ndc_rect.x + u.ndc_rect.z * p.x,
-        u.ndc_rect.y + u.ndc_rect.w * p.y,
-        0.0,
-        1.0,
-    );
-    out.uv = vec2<f32>(
-        u.uv_rect.x + (u.uv_rect.z - u.uv_rect.x) * p.x,
-        u.uv_rect.y + (u.uv_rect.w - u.uv_rect.y) * p.y,
-    );
+    out.pos = vec4<f32>(positions[idx], 0.0, 1.0);
+    out.uv = uvs[idx];
     return out;
 }
 
@@ -1455,7 +2130,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let y  = textureSample(y_tex,  samp, in.uv).r;
     let uv = textureSample(uv_tex, samp, in.uv).rg;
 
-    // BT.709 limited-range YUV (all channels normalized to [0,1])
+    // BT.709 limited-range YUV (all channels normalized to [0,1]).
+    // Output is gamma-encoded R'G'B'.
     let y_lin = 1.164 * (y - 0.0627);
     let u_off = uv.r - 0.502;
     let v_off = uv.g - 0.502;
@@ -1463,14 +2139,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let g_g = clamp(y_lin - 0.213 * u_off - 0.533 * v_off, 0.0, 1.0);
     let b_g = clamp(y_lin + 2.112 * u_off, 0.0, 1.0);
 
-    // Gamma decode to linear so the sRGB swapchain encodes correctly
-    // on store.
-    return vec4<f32>(
-        srgb_to_linear(r_g),
-        srgb_to_linear(g_g),
-        srgb_to_linear(b_g),
-        1.0,
-    );
+    // FRAGMENT_RETURN
 }
 "#;
 
@@ -1492,29 +2161,49 @@ impl Clone for YuvRenderer {
 
 impl YuvRenderer {
     fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
+        let is_srgb_target = matches!(
+            target_format,
+            wgpu::TextureFormat::Rgba8UnormSrgb
+                | wgpu::TextureFormat::Bgra8UnormSrgb
+                | wgpu::TextureFormat::Bc1RgbaUnormSrgb
+                | wgpu::TextureFormat::Bc2RgbaUnormSrgb
+                | wgpu::TextureFormat::Bc3RgbaUnormSrgb
+                | wgpu::TextureFormat::Bc7RgbaUnormSrgb
+        );
+        // Build the fragment output expression based on target format.
+        // - sRGB target: hardware encodes linear→sRGB on store, so the
+        //   shader must output LINEAR. We apply the BT.709/sRGB inverse
+        //   transfer function to the YUV→R'G'B' result.
+        // - Non-sRGB target: hardware stores bytes as-is, so the shader
+        //   must output gamma-encoded R'G'B' directly.
+        let source = if is_srgb_target {
+            NV12_SHADER_SRC.replace(
+                "// FRAGMENT_RETURN",
+                "return vec4<f32>(\
+                    srgb_to_linear(r_g),\
+                    srgb_to_linear(g_g),\
+                    srgb_to_linear(b_g),\
+                    1.0,\
+                );",
+            )
+        } else {
+            NV12_SHADER_SRC.replace(
+                "// FRAGMENT_RETURN",
+                "return vec4<f32>(r_g, g_g, b_g, 1.0);",
+            )
+        };
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("nv12_shader"),
-            source: wgpu::ShaderSource::Wgsl(NV12_SHADER_SRC.into()),
+            source: wgpu::ShaderSource::Wgsl(source.into()),
         });
 
         let bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("nv12_bind_group_layout"),
                 entries: &[
-                    // uniform buffer (ndc_rect + uv_rect)
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::VERTEX,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
                     // Y plane texture
                     wgpu::BindGroupLayoutEntry {
-                        binding: 1,
+                        binding: 0,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Texture {
                             sample_type: wgpu::TextureSampleType::Float { filterable: true },
@@ -1525,7 +2214,7 @@ impl YuvRenderer {
                     },
                     // UV plane texture
                     wgpu::BindGroupLayoutEntry {
-                        binding: 2,
+                        binding: 1,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Texture {
                             sample_type: wgpu::TextureSampleType::Float { filterable: true },
@@ -1536,9 +2225,26 @@ impl YuvRenderer {
                     },
                     // sampler
                     wgpu::BindGroupLayoutEntry {
-                        binding: 3,
+                        binding: 2,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    // NDC-rect uniform (vec4<f32>): left, top, right,
+                    // bottom in the clamped-viewport's NDC space. Lets
+                    // us draw the correct un-squished slice of the
+                    // video when the video rect extends past the
+                    // visible area (egui clamps the viewport, so a
+                    // hardcoded full-NDC quad would otherwise look
+                    // like a resize on pan).
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
                         count: None,
                     },
                 ],
@@ -1604,13 +2310,13 @@ impl YuvRenderer {
 }
 
 /// Per-video NV12 texture state: the Y plane texture, the UV plane
-/// texture, and the bind group that binds them (plus a uniform
-/// buffer) to the `YuvRenderer` pipeline.
+/// texture, and the bind group that binds them to the `YuvRenderer`
+/// pipeline.
 struct Nv12GpuState {
     y_texture: wgpu::Texture,
     uv_texture: wgpu::Texture,
+    ndc_buffer: wgpu::Buffer,
     bind_group: Arc<wgpu::BindGroup>,
-    uniform_buffer: Arc<wgpu::Buffer>,
     width: u32,
     height: u32,
 }
@@ -1621,30 +2327,9 @@ struct Nv12GpuState {
 struct Nv12PaintCallback {
     pipeline: Arc<wgpu::RenderPipeline>,
     bind_group: Arc<wgpu::BindGroup>,
-    uniform_buffer: Arc<wgpu::Buffer>,
-    /// Uniform data layout: [ndc_x, ndc_y, ndc_w, ndc_h, uv_x0, uv_y0, uv_x1, uv_y1]
-    uniform_data: [f32; 8],
 }
 
 impl egui_wgpu::CallbackTrait for Nv12PaintCallback {
-    fn prepare(
-        &self,
-        _device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        _screen_descriptor: &egui_wgpu::ScreenDescriptor,
-        _egui_encoder: &mut wgpu::CommandEncoder,
-        _callback_resources: &mut egui_wgpu::CallbackResources,
-    ) -> Vec<wgpu::CommandBuffer> {
-        let bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(
-                self.uniform_data.as_ptr() as *const u8,
-                std::mem::size_of::<[f32; 8]>(),
-            )
-        };
-        queue.write_buffer(&self.uniform_buffer, 0, bytes);
-        Vec::new()
-    }
-
     fn paint(
         &self,
         _info: egui::PaintCallbackInfo,
@@ -1680,23 +2365,35 @@ fn is_high_bit_depth_format(fmt: ffmpeg::format::Pixel) -> bool {
 fn audio_decode_loop(
     mut decoder: ffmpeg::decoder::Audio,
     mut resampler: ffmpeg::software::resampling::context::Context,
-    rx: Receiver<DecodeMsg>,
+    rx: mpsc::Receiver<DecodeMsg>,
+    shared: Arc<Shared>,
     mut audio_producer: <HeapRb<f32> as Split>::Prod,
 ) {
     let mut audio_frame = ffmpeg::frame::Audio::empty();
     let mut resampled = ffmpeg::frame::Audio::empty();
+    let mut last_flush_seq: u64 = 0;
 
     loop {
         let msg = match rx.recv() {
             Ok(m) => m,
             Err(_) => return,
         };
+        let cur_seq = shared.flush_seq.load(Ordering::Relaxed);
+        if cur_seq != last_flush_seq {
+            last_flush_seq = cur_seq;
+            decoder.flush();
+        }
         let packet = match msg {
             DecodeMsg::Flush => {
                 decoder.flush();
                 continue;
             }
-            DecodeMsg::Packet(p) => p,
+            DecodeMsg::Packet(p, tag) => {
+                if tag != last_flush_seq {
+                    continue;
+                }
+                p
+            }
         };
 
         if decoder.send_packet(&packet).is_err() {
@@ -1724,10 +2421,20 @@ fn audio_decode_loop(
 /// ring buffer. Bulk pushes are cheaper than per-sample atomic ops
 /// and avoid the per-sample sleep that on Windows stalls for the
 /// ~15 ms timer resolution when the ring is full.
+///
+/// Drops the tail of the frame if the ring stays full for longer
+/// than `PUSH_DEADLINE_MS`. The ring only stays full when the cpal
+/// consumer isn't draining — typically because playback is paused
+/// — and in that state blocking here would back-pressure the audio
+/// channel, which back-pressures the demuxer, which stops routing
+/// video packets, which leaves the UI stuck on the last-displayed
+/// frame after any seek. Dropping audio in that state matches
+/// VLC/mpv behavior: favour video liveness over stale audio.
 fn push_planar_stereo(
     frame: &ffmpeg::frame::Audio,
     producer: &mut <HeapRb<f32> as Split>::Prod,
 ) {
+    const PUSH_DEADLINE_MS: u128 = 4;
     let nb = frame.samples();
     if nb == 0 {
         return;
@@ -1745,13 +2452,17 @@ fn push_planar_stereo(
         interleaved.push(*right.get(i).unwrap_or(&0.0));
     }
     let mut offset = 0usize;
+    let start = Instant::now();
     while offset < interleaved.len() {
         let pushed = producer.push_slice(&interleaved[offset..]);
         offset += pushed;
-        if offset < interleaved.len() {
-            // Ring is full — yield to let the cpal callback drain some.
-            std::thread::yield_now();
+        if offset >= interleaved.len() {
+            break;
         }
+        if start.elapsed().as_millis() > PUSH_DEADLINE_MS {
+            break;
+        }
+        std::thread::yield_now();
     }
 }
 

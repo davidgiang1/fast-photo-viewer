@@ -32,6 +32,7 @@ rawloader = "0.37"
 imagepipe = "0.5"
 cpal = "0.15"
 ringbuf = "0.4"
+pollster = "0.3"
 
 # Patched locally: upstream 2.0.1 panics in
 # software::resampling::context::Context::get_with2 when the source audio

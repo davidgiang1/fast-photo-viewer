@@ -459,6 +459,9 @@ struct PhotoViewer {
     is_video: bool,
     video_looping: bool,
     video_volume: f32,
+    /// Remembers the volume level before the user muted so clicking
+    /// the speaker icon restores it instead of snapping back to 0.
+    video_pre_mute_volume: f32,
     video_has_audio: bool,
     seek_frac: f32,
     video_rotation: u16,
@@ -520,6 +523,7 @@ impl PhotoViewer {
             is_video: false,
             video_looping: true,
             video_volume: 0.10,
+            video_pre_mute_volume: 0.10,
             video_has_audio: true,
             seek_frac: 0.0,
             video_rotation: 0,
@@ -895,10 +899,11 @@ impl PhotoViewer {
         let hours = total_secs / 3600;
         let mins = (total_secs % 3600) / 60;
         let secs = total_secs % 60;
+        let millis = (ms.rem_euclid(1000)) as i32;
         if hours > 0 {
-            format!("{:02}:{:02}:{:02}", hours, mins, secs)
+            format!("{:02}:{:02}:{:02}.{:03}", hours, mins, secs, millis)
         } else {
-            format!("{:02}:{:02}", mins, secs)
+            format!("{:02}:{:02}.{:03}", mins, secs, millis)
         }
     }
 
@@ -978,6 +983,24 @@ impl eframe::App for PhotoViewer {
                             player.seek(target);
                         }
                     }
+                }
+            }
+            // Frame-step: comma = back 1 frame, period = forward 1 frame.
+            // Auto-pauses on first use so stepping is predictable.
+            if ctx.input(|i| i.key_pressed(egui::Key::Comma)) {
+                if let Some(player) = &mut self.video_player {
+                    if matches!(player.state(), PlayerState::Playing) {
+                        player.pause();
+                    }
+                    player.step_frames(-1);
+                }
+            }
+            if ctx.input(|i| i.key_pressed(egui::Key::Period)) {
+                if let Some(player) = &mut self.video_player {
+                    if matches!(player.state(), PlayerState::Playing) {
+                        player.pause();
+                    }
+                    player.step_frames(1);
                 }
             }
             // Volume: Up/Down arrows ±2%
@@ -1139,20 +1162,28 @@ impl eframe::App for PhotoViewer {
                         display_size,
                     );
 
+                    // Tell the NV12 renderer the *unclamped* video
+                    // rect so its vertex shader can compute the right
+                    // NDC slice. Without this the shader draws a
+                    // full-NDC quad into egui's clamped viewport and
+                    // panning past the edge looks like a resize.
+                    if player.is_nv12_path() {
+                        let screen_rect = ctx.screen_rect();
+                        player.set_nv12_render_rect(
+                            video_rect,
+                            screen_rect.size(),
+                            ctx.pixels_per_point(),
+                        );
+                    }
+
                     // Render via painter directly (not render_frame_at) so our
                     // click interaction isn't consumed by an internal widget.
                     if player.is_nv12_path() {
                         // Partial Phase E: custom wgpu pipeline that
                         // samples Y + UV and does YUV→RGB in the
                         // fragment shader. Rotation is not yet
-                        // supported on this path; for rotated video
-                        // fall back briefly to RGBA.
-                        let screen = ctx.screen_rect();
-                        if let Some(cb) = player.nv12_paint_callback(
-                            screen,
-                            video_rect,
-                            [0.0, 0.0, 1.0, 1.0],
-                        ) {
+                        // supported on this path.
+                        if let Some(cb) = player.nv12_paint_callback(video_rect) {
                             ui.painter().add(egui::Shape::Callback(cb));
                         }
                     } else if let Some(texture_id) = player.texture_id() {
@@ -1486,6 +1517,13 @@ impl eframe::App for PhotoViewer {
                                             }
 
                                             if self.video_has_audio {
+                                                let vol_pct = (self.video_volume * 100.0)
+                                                    .round() as i32;
+                                                ui.label(
+                                                    egui::RichText::new(format!("{}%", vol_pct))
+                                                        .color(egui::Color32::WHITE)
+                                                        .monospace(),
+                                                );
                                                 let vol_slider = egui::Slider::new(
                                                     &mut self.video_volume,
                                                     0.0..=1.0,
@@ -1497,20 +1535,37 @@ impl eframe::App for PhotoViewer {
                                                 if vol_response.changed() {
                                                     player.set_volume(self.video_volume);
                                                 }
-                                                vol_response.on_hover_text(format!(
-                                                    "{}%",
-                                                    (self.video_volume * 100.0).round() as i32
-                                                ));
+                                                vol_response.on_hover_text(format!("{}%", vol_pct));
 
                                                 let vol_icon = if self.video_volume == 0.0 {
                                                     "🔇"
                                                 } else {
                                                     "🔊"
                                                 };
-                                                ui.label(
-                                                    egui::RichText::new(vol_icon)
-                                                        .color(egui::Color32::WHITE),
-                                                );
+                                                if ui
+                                                    .add(egui::Button::new(
+                                                        egui::RichText::new(vol_icon)
+                                                            .color(egui::Color32::WHITE),
+                                                    ))
+                                                    .on_hover_text("Mute / unmute")
+                                                    .clicked()
+                                                {
+                                                    if self.video_volume > 0.0 {
+                                                        self.video_pre_mute_volume =
+                                                            self.video_volume;
+                                                        self.video_volume = 0.0;
+                                                    } else {
+                                                        self.video_volume = if self
+                                                            .video_pre_mute_volume
+                                                            > 0.0
+                                                        {
+                                                            self.video_pre_mute_volume
+                                                        } else {
+                                                            0.10
+                                                        };
+                                                    }
+                                                    player.set_volume(self.video_volume);
+                                                }
                                             } else {
                                                 ui.label(
                                                     egui::RichText::new("🔇 No Audio").color(
@@ -1568,7 +1623,9 @@ impl eframe::App for PhotoViewer {
                                 "Press 'O' to Open Folder  |  'F' to Open File\n\n\
                                  Images: Space / Right Arrow = Next  |  Left Arrow = Prev  |  +/- Zoom\n\
                                  Videos: Left/Right Arrow = Seek 3s  |  Ctrl + Left/Right = Prev/Next\n\
+                                 Videos: , / . = Step back / forward one frame (auto-pauses)\n\
                                  Space: Play/Pause (video)  |  Next (image)\n\
+                                 Up/Down: Volume ±2%  |  Click 🔊 to mute / unmute\n\
                                  Scroll to Zoom  |  Drag to Pan  |  0: Reset View\n\
                                  F11: Fullscreen  |  M: Filter  |  R: Random / Ordered\n\
                                  Double-tap Esc: Close",
@@ -1635,10 +1692,17 @@ impl eframe::App for PhotoViewer {
                     });
             }
 
-            // Controls overlay — rotation for both images and videos
+            // Controls overlay — rotation for both images and videos.
+            // When a video is loaded we lift the overlay above the
+            // floating playback panel so the rotate / explorer
+            // buttons don't get hidden underneath it.
             if self.current_media_path.is_some() {
+                let controls_offset_y = if self.is_video { -128.0 } else { -10.0 };
                 egui::Window::new("Controls")
-                    .anchor(egui::Align2::RIGHT_BOTTOM, [-10.0, -10.0])
+                    .anchor(
+                        egui::Align2::RIGHT_BOTTOM,
+                        [-10.0, controls_offset_y],
+                    )
                     .title_bar(false)
                     .resizable(false)
                     .auto_sized()
@@ -1674,5 +1738,17 @@ impl eframe::App for PhotoViewer {
                     });
             }
         });
+
+        // Must run AFTER all input handling in this frame: a
+        // `player.seek(...)` called from a keypress handler earlier
+        // in `update()` needs the post-keypress `is_seeking()`
+        // state to trigger the keep-alive repaint burst, otherwise
+        // the scheduled repaint for the NEXT tick cycle is missed
+        // and back-to-back seeks leave the displayed frame stale.
+        if let Some(player) = &self.video_player {
+            if player.is_seeking() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(8));
+            }
+        }
     }
 }
