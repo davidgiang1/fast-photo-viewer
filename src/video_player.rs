@@ -1144,6 +1144,57 @@ impl Drop for Player {
 
 type AudioConsumer = <HeapRb<f32> as Split>::Cons;
 
+/// Copy samples from `pop` into `data` as interleaved PCM for
+/// `channels` output channels, scaled by `volume`. Returns the number
+/// of audio frames whose samples were actually popped — NOT the total
+/// number of output frames written.
+///
+/// The distinction is load-bearing for A/V sync. The audio callback
+/// uses the returned count to advance the master `audio_clock_us`
+/// against which video frames are scheduled. If a ring underrun
+/// occurs mid-buffer, the remainder of `data` is zero-filled and the
+/// returned count stays at the pre-underrun value, so the clock stops
+/// advancing until real samples are available again. Counting
+/// silence-filled frames would let the clock drift past the audio
+/// actually played, and because the error is never corrected, every
+/// brief underrun (scheduler jitter, decoder stall, seek transient)
+/// compounds into a permanent video-ahead-of-audio drift.
+fn mix_audio_output<F: FnMut() -> Option<f32>>(
+    data: &mut [f32],
+    channels: usize,
+    volume: f32,
+    mut pop: F,
+) -> usize {
+    let frames = data.len() / channels.max(1);
+    let mut played = 0usize;
+    for frame in 0..frames {
+        let Some(l) = pop() else {
+            for f in frame..frames {
+                for c in 0..channels {
+                    data[f * channels + c] = 0.0;
+                }
+            }
+            break;
+        };
+        // Resampler outputs stereo; if cpal wants more channels,
+        // duplicate; if mono, take L and still pop R to keep the
+        // ring aligned on stereo pairs.
+        let r = pop().unwrap_or(l);
+        for c in 0..channels {
+            let sample = if c == 0 {
+                l
+            } else if c == 1 {
+                r
+            } else {
+                (l + r) * 0.5
+            };
+            data[frame * channels + c] = sample * volume;
+        }
+        played += 1;
+    }
+    played
+}
+
 fn setup_audio_stream(
     mut consumer: AudioConsumer,
     shared: Arc<Shared>,
@@ -1184,20 +1235,8 @@ fn setup_audio_stream(
                     if shared_cb.audio_drain_flag.swap(false, Ordering::Relaxed) {
                         while consumer.try_pop().is_some() {}
                     }
-                    let mut played_frames = 0usize;
-                    // data is interleaved `channels` samples per frame.
-                    let frames = data.len() / channels.max(1);
-                    for frame in 0..frames {
-                        // Our resampler outputs stereo; if cpal wants
-                        // more channels, duplicate; if mono, take L.
-                        let l = consumer.try_pop().unwrap_or(0.0);
-                        let r = consumer.try_pop().unwrap_or(l);
-                        for ch in 0..channels {
-                            let sample = if ch == 0 { l } else if ch == 1 { r } else { (l + r) * 0.5 };
-                            data[frame * channels + ch] = sample * volume;
-                        }
-                        played_frames += 1;
-                    }
+                    let played_frames =
+                        mix_audio_output(data, channels, volume, || consumer.try_pop());
                     if !frozen && played_frames > 0 {
                         let advance_us = (played_frames as f64 * us_per_frame) as i64;
                         shared_cb
@@ -2517,4 +2556,162 @@ unsafe fn try_enable_hw_accel(cctx: *mut AVCodecContext) -> bool {
     (*cctx).get_format = Some(get_hw_format);
     av_buffer_unref(&mut hw_dev);
     true
+}
+
+// =========================================================================
+// Tests
+// =========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a pop-closure that drains `samples` front-to-back and
+    /// returns `None` once empty. Used by the mix_audio_output tests
+    /// to simulate a ring buffer with a fixed number of stereo samples.
+    fn make_pop(samples: Vec<f32>) -> impl FnMut() -> Option<f32> {
+        let mut idx = 0usize;
+        move || {
+            if idx < samples.len() {
+                let v = samples[idx];
+                idx += 1;
+                Some(v)
+            } else {
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn mix_full_stereo_copies_samples_verbatim() {
+        let mut data = vec![0.0f32; 6];
+        let played =
+            mix_audio_output(&mut data, 2, 1.0, make_pop(vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6]));
+        assert_eq!(played, 3);
+        assert_eq!(data, vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6]);
+    }
+
+    #[test]
+    fn mix_applies_volume() {
+        let mut data = vec![0.0f32; 4];
+        let played = mix_audio_output(&mut data, 2, 0.5, make_pop(vec![1.0, 1.0, 1.0, 1.0]));
+        assert_eq!(played, 2);
+        for s in &data {
+            assert!((*s - 0.5).abs() < 1e-6, "sample {} not attenuated", s);
+        }
+    }
+
+    /// The core A/V-sync regression: a fully-empty ring must return 0
+    /// so the caller doesn't advance the audio clock. If this returns
+    /// anything > 0, video drifts permanently ahead of audio on every
+    /// underrun.
+    #[test]
+    fn mix_full_underrun_returns_zero_and_zero_fills() {
+        // Preload with garbage so we can verify the function overwrites
+        // the entire buffer with silence.
+        let mut data = vec![0.7f32; 8];
+        let played = mix_audio_output(&mut data, 2, 1.0, || None);
+        assert_eq!(played, 0, "underrun must not count any played frames");
+        assert!(
+            data.iter().all(|&s| s == 0.0),
+            "underrun must zero-fill the entire output; got {:?}",
+            data
+        );
+    }
+
+    /// Partial underrun: ring has some samples, cpal asks for more
+    /// than it can supply. Clock must advance only over the samples
+    /// that were actually popped, and the tail of the output must be
+    /// silence so we don't play whatever stale data was in the buffer.
+    #[test]
+    fn mix_partial_underrun_counts_only_real_frames() {
+        // 2 stereo frames in the ring (4 samples), cpal asks for 6
+        // frames (12 samples).
+        let mut data = vec![0.9f32; 12];
+        let played = mix_audio_output(&mut data, 2, 1.0, make_pop(vec![0.1, 0.2, 0.3, 0.4]));
+        assert_eq!(played, 2, "must only count popped frames");
+        assert_eq!(&data[..4], &[0.1, 0.2, 0.3, 0.4]);
+        assert!(
+            data[4..].iter().all(|&s| s == 0.0),
+            "tail after underrun must be silence; got {:?}",
+            &data[4..]
+        );
+    }
+
+    /// Regression check: after an underrun the silence the function
+    /// writes must not leak into the next call's played count.
+    /// Running mix_audio_output back-to-back against a drained source
+    /// must always return 0, not phantom frames from the prior
+    /// zero-fill.
+    #[test]
+    fn mix_underrun_does_not_leak_into_next_call() {
+        // 3 stereo frames in the ring, cpal asks for 5 each call.
+        let mut pop = make_pop(vec![0.1, 0.1, 0.2, 0.2, 0.3, 0.3]);
+        let mut data = vec![0.0f32; 10];
+        let p1 = mix_audio_output(&mut data, 2, 1.0, &mut pop);
+        let p2 = mix_audio_output(&mut data, 2, 1.0, &mut pop);
+        let p3 = mix_audio_output(&mut data, 2, 1.0, &mut pop);
+        assert_eq!(p1, 3, "first call must return only the available frames");
+        assert_eq!(p2, 0, "second call must return 0 — silence is not a played frame");
+        assert_eq!(p3, 0, "further calls must stay at 0");
+    }
+
+    #[test]
+    fn mix_mono_output_takes_left_and_drops_right() {
+        let mut data = vec![0.0f32; 2];
+        let played = mix_audio_output(&mut data, 1, 1.0, make_pop(vec![1.0, 2.0, 3.0, 4.0]));
+        assert_eq!(played, 2);
+        assert_eq!(data, vec![1.0, 3.0]);
+    }
+
+    #[test]
+    fn mix_surround_duplicates_stereo_to_extra_channels() {
+        let mut data = vec![0.0f32; 4];
+        let played = mix_audio_output(&mut data, 4, 1.0, make_pop(vec![0.2, 0.4]));
+        assert_eq!(played, 1);
+        assert!((data[0] - 0.2).abs() < 1e-6);
+        assert!((data[1] - 0.4).abs() < 1e-6);
+        assert!(
+            (data[2] - 0.3).abs() < 1e-6,
+            "channel 2 should mix L+R (got {})",
+            data[2]
+        );
+        assert!(
+            (data[3] - 0.3).abs() < 1e-6,
+            "channel 3 should mix L+R (got {})",
+            data[3]
+        );
+    }
+
+    /// End-to-end clock-advance check: simulate a realistic cpal
+    /// callback sequence at 48 kHz where the decoder produces only
+    /// 0.5 s worth of audio but cpal asks for 1 s. The returned
+    /// played count, multiplied by `us_per_frame`, must be 500_000 us
+    /// — not 1_000_000 us. This is the exact failure pattern that
+    /// caused the original desync-over-time bug: each underrun used
+    /// to advance the clock past the actual audio played.
+    #[test]
+    fn mix_clock_advance_matches_real_samples_only() {
+        const SR: usize = 48_000;
+        let us_per_frame = 1_000_000.0_f64 / SR as f64;
+        let in_frames = SR / 2; // 0.5 s of stereo
+        let samples: Vec<f32> = (0..in_frames * 2).map(|i| (i as f32) * 1e-6).collect();
+        let mut data = vec![0.0f32; SR * 2];
+        let played = mix_audio_output(&mut data, 2, 1.0, make_pop(samples));
+        assert_eq!(played, in_frames);
+        let advance_us = (played as f64 * us_per_frame) as i64;
+        assert_eq!(
+            advance_us, 500_000,
+            "clock must advance 0.5 s, not the full 1 s request"
+        );
+        // And the unfilled tail must be silence — otherwise the cpal
+        // device would replay whatever was in the buffer previously.
+        for i in in_frames * 2..data.len() {
+            assert_eq!(
+                data[i], 0.0,
+                "sample {} past underrun must be silence",
+                i
+            );
+        }
+    }
 }
