@@ -1555,7 +1555,7 @@ dependencies = [
 
 [[package]]
 name = "fast-photo-viewer"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "cpal",
  "eframe",
